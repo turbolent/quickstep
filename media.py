@@ -780,6 +780,19 @@ def skip_boot_language_selection(image: PathInput, *, nextufs_binary: PathInput 
             raise ValueError("boot language table readback failed")
 
 
+# Complete instruction sequences, including the IRQ7/IRQ15 tests and exit jump.
+# Patch 4 moves this code and the spurious-interrupt counter it references.
+# Keep in sync with fix-pic-bug.pl; tests compare both patchers' results.
+_PIC_PROFILES = (
+    ("OPENSTEP 4.2", 0x8c70a, "7d0f83fb0f7517baa0000000ec84c07c0dff05d8691f00e9260100009090"),
+    ("OPENSTEP 4.2 Patch 4", 0x8c88e, "7d0f83fb0f7517baa0000000ec84c07c0dff05187a1f00e9260100009090"),
+)
+
+
+def _pic_replacement(original: bytes) -> bytes:
+    return bytes.fromhex("7d13") + original[2:17] + bytes.fromhex("b062e620e92801000090909090")
+
+
 def patch_pic_kernel(kernel: bytes) -> bytes:
     """Fix spurious IRQ15 handling in the OPENSTEP 4.2 Intel kernel.
 
@@ -795,23 +808,20 @@ def patch_pic_kernel(kernel: bytes) -> bytes:
     Retarget the spurious IRQ7 branch to skip this EOI, since a spurious
     master-PIC interrupt needs no acknowledgement.
 
-    These two fixed-offset edits change 12 bytes in the original kernel.
-    Accept already-patched sites; reject unknown signatures or truncated input.
+    These edits change 12 bytes. Match the complete instruction sequence at
+    the known stock or Patch 4 offset; accept an already-patched kernel and
+    reject unknown, partially patched or truncated input.
     Patch source:
     https://github.com/onionmixer/OPENSTEP-BOOTCD-INTEL/blob/master/04_tools/patch_kernel_pic.py
     """
-    if kernel[:4] != bytes.fromhex("cefaedfe"):
+    if len(kernel) < 28 or kernel[:8] != bytes.fromhex("cefaedfe07000000"):
         raise ValueError("expected an i386 Mach-O kernel")
-    patched = bytearray(kernel)
-    for offset, oldhex, newhex in (
-        (0x8c70a, "7d0f", "7d13"),
-        (0x8c71b, "ff05d8691f00e9260100009090", "b062e620e92801000090909090"),
-    ):
-        old, new = bytes.fromhex(oldhex), bytes.fromhex(newhex)
-        if kernel[offset:offset + len(old)] not in (old, new):
-            raise ValueError(f"PIC patch signature mismatch at kernel offset {offset:#x}")
-        patched[offset:offset + len(new)] = new
-    return bytes(patched)
+    for _, offset, oldhex in _PIC_PROFILES:
+        old = bytes.fromhex(oldhex)
+        new = _pic_replacement(old)
+        if kernel[offset:offset + len(old)] in (old, new):
+            return kernel[:offset] + new + kernel[offset + len(old):]
+    raise ValueError("PIC patch signature mismatch: expected a stock OPENSTEP 4.2 or Patch 4 kernel")
 
 
 def patch_kernel_pic_bug(source: PathInput, output: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
@@ -857,6 +867,16 @@ def _i386_kernel(kernel: bytes) -> bytes:
 
 _INSTALL_DRIVER_ARCHIVE = "/NextCD/BootDrivers.tar"
 _INSTALL_KERNEL = "/NextCD/mach_kernel.picfix"
+_INSTALL_PIC_SCRIPT = "/NextCD/fix-pic-bug"
+
+
+def _pic_fix_script() -> bytes:
+    """Read the standalone helper, compatible with OPENSTEP's bundled Perl 5."""
+    # Resolve beside the library, not the caller's working directory. Text mode
+    # normalizes Windows checkouts to LF for OPENSTEP's interpreter/shebang.
+    return Path(__file__).with_name("fix-pic-bug.pl").read_text(encoding="ascii").encode("ascii")
+
+
 _INSTALL_DRIVER_ANCHOR = b'\n${SYNC}\n\necho\n${CHECKFLOP}'
 _INSTALL_DRIVER_HOOK = br'''
 # BEGIN quickstep boot drivers
@@ -924,11 +944,18 @@ _INSTALL_PIC_HOOK = br'''    echo "Installing PIC-patched kernel on the startup 
         echo "Cannot install PIC-patched kernel; installation stopped."
         exit 1
     fi
+    echo "Installing /usr/bin/fix-pic-bug on the startup disk..."
+    if ${CP} -p "${CDDIR}/fix-pic-bug" "${HD}/usr/bin/fix-pic-bug"; then
+        echo "PIC patch helper installed; run it after installing User Patch 4."
+    else
+        echo "Cannot install PIC patch helper; installation stopped."
+        exit 1
+    fi
 '''
 
 
 def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_bug: bool = False) -> bytes:
-    """Install drivers and optionally a patched kernel before final sync and reboot."""
+    """Install drivers and optionally a patched kernel/helper before final reboot."""
     names = list(boot_drivers)
     # These names are embedded in both a shell argument and an OPENSTEP table.
     if not names or any(re.fullmatch(r"[A-Za-z0-9_.+-]+", name) is None for name in names):
@@ -991,6 +1018,7 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     With fix_pic_bug, derive the installed kernel from the User CD, not the boot
     floppy. Stage a thin, patched copy for rc.cdrom to install after ditto's
     base-system copy; leave the CD's original /mach_kernel untouched.
+    Also install /usr/bin/fix-pic-bug so Patch 4's kernel can be patched later.
     Otherwise, leave kernel installation entirely to the original installer.
     """
     with new_output(output, source=user_ufs) as staged:
@@ -1000,7 +1028,7 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
         _, system = system_table(Image(executable(nextufs_binary), boot))
         script = _patch_cd_installer(image.read(path, entry), driver_lists(system)[0], fix_pic_bug=fix_pic_bug)
         archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary)
-        for payload in (_INSTALL_DRIVER_ARCHIVE, _INSTALL_KERNEL):
+        for payload in (_INSTALL_DRIVER_ARCHIVE, _INSTALL_KERNEL, _INSTALL_PIC_SCRIPT):
             if image.child("/NextCD", payload.rsplit("/", 1)[1]) is not None:
                 raise ValueError(f"User filesystem already contains {payload}")
         metadata = replace(entry, mode=stat.S_IFREG | 0o644, size=len(archive))
@@ -1011,6 +1039,11 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
             image.write(_INSTALL_KERNEL, kernel, replace(kernel_entry, size=len(kernel)), exists=False)
             if image.read(_INSTALL_KERNEL) != kernel:
                 raise ValueError("installation kernel payload readback failed")
+            helper = _pic_fix_script()
+            image.write(_INSTALL_PIC_SCRIPT, helper,
+                        replace(entry, mode=stat.S_IFREG | 0o755, uid=0, gid=0, size=len(helper)), exists=False)
+            if image.read(_INSTALL_PIC_SCRIPT) != helper:
+                raise ValueError("PIC patch helper payload readback failed")
         image.write(path, script, entry, exists=True)
         if image.read(path) != script or image.read(_INSTALL_DRIVER_ARCHIVE) != archive:
             raise ValueError("installation-driver payload readback failed")
@@ -1547,8 +1580,16 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
             expected_kernel = patch_pic_kernel(_i386_kernel(original_kernel))
             if nextufs("browse", "--raw", iso, _INSTALL_KERNEL, binary=nextufs_binary) != expected_kernel:
                 raise ValueError("installation kernel differs from the PIC-patched User CD Intel kernel")
-        elif Image(executable(nextufs_binary), iso).child("/NextCD", "mach_kernel.picfix") is not None:
-            raise ValueError("unexpected PIC-patched installation kernel without fix_pic_bug")
+            image = Image(executable(nextufs_binary), iso)
+            helper = image.inspect(_INSTALL_PIC_SCRIPT)[0]
+            if ((helper.mode, helper.uid, helper.gid) != (stat.S_IFREG | 0o755, 0, 0) or
+                    image.read(_INSTALL_PIC_SCRIPT) != _pic_fix_script()):
+                raise ValueError("PIC patch helper differs or has incorrect permissions/ownership")
+        else:
+            image = Image(executable(nextufs_binary), iso)
+            for payload in (_INSTALL_KERNEL, _INSTALL_PIC_SCRIPT):
+                if image.child("/NextCD", payload.rsplit("/", 1)[1]) is not None:
+                    raise ValueError(f"unexpected {payload} without fix_pic_bug")
     else:
         check_payload(user_cd, user_layout.slice_base // 2048, ufs)
         expected_script = original_script
