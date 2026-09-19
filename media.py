@@ -1,0 +1,1558 @@
+"""Offline OPENSTEP media and driver operations.
+
+UFS access is delegated to the nextufs executable.
+See build_cd.py for an example bootable-CD recipe using this library.
+"""
+
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+import io
+import json
+import os
+from pathlib import Path, PureWindowsPath
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+from typing import TypeAlias
+
+
+ROOT = "/private/Drivers/i386"
+MANIFEST = ".media-metadata"
+__all__ = [
+    "DriverImage", "MediaError", "PathInput", "DiskLabel", "FilesystemInfo", "ImageInfo", "IsoLayout",
+    "nextufs", "new_output", "resolve_iso_tool", "image_info", "cd_layout", "extract_ufs", "grow_image",
+    "check_image", "pad_image", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
+    "prepare_installation_drivers", "verify_boot_cd",
+    "skip_boot_language_selection",
+    "copy_directory", "verify_directory_copy",
+    "copy_tar", "verify_tar_copy", "tar_entries",
+    "MAX_GROWN_FLOPPY_KIB", "MAX_BOOT_FLOPPY_KIB",
+]
+PathInput: TypeAlias = str | os.PathLike[str]
+
+
+class MediaError(Exception):
+    """An operational or validation error from the media API."""
+
+
+def component(name: str) -> str:
+    """Accept a single image path component, never a path or NUL."""
+    if not name or name in (".", "..") or any(c in name for c in "/\\\0"):
+        raise MediaError(f"invalid path component: {name!r}")
+    return name
+
+
+def driver_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise MediaError("driver name must be a string")
+    if name.endswith(".config"):
+        name = name[:-7]
+    component(name)
+    if any(c.isspace() for c in name):
+        raise MediaError("driver names cannot contain whitespace")
+    return name
+
+
+@dataclass(frozen=True)
+class Entry:
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    size: int
+    atime: int
+    mtime: int
+    name: str
+
+    def __post_init__(self) -> None:
+        values = (self.inode, self.mode, self.uid, self.gid, self.size, self.atime, self.mtime)
+        if (any(type(value) is not int or value < 0 for value in values) or
+                self.mode > 0xffff or max(self.uid, self.gid) > 0xffff or
+                max(self.atime, self.mtime) > 0xffffffff):
+            raise MediaError("invalid metadata: expected nonnegative integers within UFS field limits")
+        if not isinstance(self.name, str) or "\0" in self.name:
+            raise MediaError("invalid metadata filename")
+
+    @property
+    def is_dir(self) -> bool:
+        return stat.S_ISDIR(self.mode)
+
+
+def records(data: str | bytes) -> list[Entry]:
+    """Decode browse --json or a JSON extraction manifest into typed entries."""
+    try:
+        items = json.loads(data)
+        if not isinstance(items, list) or not items:
+            raise ValueError("expected a nonempty array of metadata entries")
+        return [Entry(**item) for item in items]
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise MediaError(f"invalid JSON metadata: {exc}") from exc
+
+
+def records_json(entries: Iterable[Entry]) -> bytes:
+    return (json.dumps([asdict(entry) for entry in entries], indent=2) + "\n").encode("utf-8")
+
+
+def manifest_records(data: bytes) -> list[Entry]:
+    """Also accept binary manifests saved by earlier versions of media.py."""
+    if not data.endswith(b"\0"):
+        return records(data)
+    result = []
+    for record in data[:-1].split(b"\0"):
+        fields = record.split(b"\t", 7)
+        try:
+            if len(fields) != 8:
+                raise ValueError("wrong field count")
+            values = [int(value, 8 if i == 1 else 10)
+                      for i, value in enumerate(fields[:7])]
+            inode, mode, uid, gid, size, atime, mtime = values
+            entry = Entry(inode, mode, uid, gid, size, atime, mtime, fields[7].decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise MediaError(f"invalid metadata record: {exc}") from exc
+        result.append(entry)
+    return result
+
+
+# A .table is a sequence of quoted assignments or bare quoted flags, not XML.
+TOKEN = re.compile(r'\s+|/\*.*?\*/|//[^\r\n]*|"(?:\\.|[^"\\])*"|[=;]', re.S)
+
+
+def unquote(token: str) -> str:
+    def escape(match: re.Match[str]) -> str:
+        value = match[1]
+        if value[0] in "01234567":
+            return chr(int(value, 8))
+        return {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}.get(value, value)
+    return re.sub(r"\\([0-7]{1,3}|.)", escape, token[1:-1], flags=re.S)
+
+
+def quote(value: str) -> str:
+    if "\0" in value:
+        raise MediaError("table values cannot contain NUL")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace(
+        "\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + '"'
+
+
+class Table:
+    """Edit selected entries while preserving unrelated text and comments."""
+
+    def __init__(self, data: bytes) -> None:
+        self.text = data.decode("latin-1")
+        self.entries: list[tuple[str, str | None, int, int]] = []
+        tokens = []
+        pos = 0
+        while pos < len(self.text):
+            match = TOKEN.match(self.text, pos)
+            if not match:
+                raise MediaError(f"invalid .table syntax at character {pos}")
+            token = match[0]
+            if not token.isspace() and not token.startswith(("/*", "//")):
+                tokens.append((token, pos, match.end()))
+            pos = match.end()
+        i = 0
+        while i < len(tokens):
+            key, start, _ = tokens[i]
+            if not key.startswith('"'):
+                raise MediaError(f"expected quoted key at character {start}")
+            i += 1
+            value: str | None = None  # A bare flag, e.g. "Boot Driver";
+            if i < len(tokens) and tokens[i][0] == "=":
+                i += 1
+                if i == len(tokens) or not tokens[i][0].startswith('"'):
+                    raise MediaError(f"expected quoted value for {key}")
+                value = unquote(tokens[i][0])
+                i += 1
+            if i == len(tokens) or tokens[i][0] != ";":
+                raise MediaError(f"expected semicolon after {key}")
+            self.entries.append((unquote(key), value, start, tokens[i][2]))
+            i += 1
+
+    def get(self, key: str, default: str | None = "") -> str | None:
+        return next((value for name, value, _, _ in reversed(self.entries)
+                     if name == key), default)
+
+    def set(self, key: str, value: str) -> None:
+        replacement = f"{quote(key)} = {quote(value)};"
+        matches = [e for e in self.entries if e[0] == key]
+        text = self.text
+        if matches:
+            # Replace the last definition and remove earlier duplicates.
+            for _, _, start, end in reversed(matches):
+                text = text[:start] + replacement + text[end:]
+                replacement = ""
+        else:
+            newline = "\r\n" if "\r\n" in text else "\n"
+            text += ("" if not text or text.endswith("\n") else newline) + replacement + newline
+        try:
+            updated = Table(text.encode("latin-1"))
+        except UnicodeEncodeError as exc:
+            raise MediaError("OPENSTEP table values must fit the single-byte encoding") from exc
+        self.text, self.entries = updated.text, updated.entries
+
+    def data(self) -> bytes:
+        return self.text.encode("latin-1")
+
+    def remove(self, key: str) -> None:
+        text = self.text
+        for name, _, start, end in reversed(self.entries):
+            if name == key:
+                text = text[:start] + text[end:]
+        updated = Table(text.encode("latin-1"))
+        self.text, self.entries = updated.text, updated.entries
+
+    def is_boot(self) -> bool:
+        value = self.get("Boot Driver", "No")
+        if value is None or value.strip().lower() in ("yes", "true", "1", "boot driver"):
+            return True
+        if value.strip().lower() in ("no", "false", "0", ""):
+            return False
+        raise MediaError(f"unrecognized Boot Driver value: {value!r}")
+
+
+def driver_lists(table: Table) -> list[list[str]]:
+    result = []
+    for key in ("Boot Drivers", "Active Drivers"):
+        value = table.get(key)
+        if value is None:
+            raise MediaError(f"{key} must have a quoted value")
+        names = value.split()
+        for name in names:
+            driver_name(name)
+        result.append(names)
+    return result
+
+
+def activate(table: Table, name: str, boot: bool, dependencies: Iterable[str]) -> None:
+    lists = driver_lists(table)
+    target = 0 if boot else 1
+    dependencies = list(dict.fromkeys(dependencies))
+    if name in dependencies:
+        raise MediaError("a driver cannot depend on itself")
+    for dep in dependencies:
+        if dep not in lists[0] and dep not in lists[1]:
+            raise MediaError(f"dependency {dep} is not active; activate it first")
+        if boot and dep not in lists[0]:
+            raise MediaError(f"boot driver {name} cannot depend on active-stage driver {dep}")
+    old_position = lists[target].index(name) if name in lists[target] else len(lists[target])
+    lists = [[item for item in items if item != name] for items in lists]
+    after = max((i + 1 for i, item in enumerate(lists[target])
+                 if item in dependencies), default=0)
+    lists[target].insert(max(min(old_position, len(lists[target])), after), name)
+    for key, items in zip(("Boot Drivers", "Active Drivers"), lists):
+        table.set(key, " ".join(items))
+
+
+def deactivate(table: Table, name: str) -> None:
+    for key, items in zip(("Boot Drivers", "Active Drivers"), driver_lists(table)):
+        table.set(key, " ".join(item for item in items if item != name))
+
+
+def executable(explicit: PathInput | None = None) -> str:
+    if explicit:
+        found = shutil.which(os.fspath(explicit))
+        if found:
+            return str(Path(found).absolute())
+        raise MediaError(f"nextufs executable not found: {explicit}")
+    name = "nextufs.exe" if os.name == "nt" else "nextufs"
+    root = Path(__file__).resolve().parent
+    for candidate in (root / "nextufs" / name, root / name):
+        if candidate.is_file():
+            return str(candidate)
+    found = shutil.which(name)
+    if not found:
+        raise MediaError("build nextufs first, or pass --nextufs PATH")
+    return found
+
+
+class Image:
+    """Internal nextufs adapter; use DriverImage for transactional operations."""
+
+    def __init__(self, binary: str, path: PathInput, root: str = ROOT) -> None:
+        self.binary = binary
+        self.path = Path(path).absolute()
+        if not root.startswith("/"):
+            raise MediaError("driver root must be an absolute image path")
+        for part in root.strip("/").split("/"):
+            component(part)
+        self.root = root.rstrip("/")
+
+    def nextufs(self, *args: PathInput | int) -> bytes:
+        return nextufs(*args, binary=self.binary)
+
+    def inspect(self, path: str) -> list[Entry]:
+        entries = records(self.nextufs("browse", "--json", self.path, path))
+        if entries[0].name != ".":
+            raise MediaError("missing self record in nextufs output")
+        names = set()
+        for entry in entries[1:]:
+            component(entry.name)
+            if entry.name in names:
+                raise MediaError(f"duplicate directory entry: {entry.name}")
+            names.add(entry.name)
+        return entries
+
+    def check_root(self) -> None:
+        path = ""
+        for part in self.root.strip("/").split("/"):
+            path += "/" + part
+            if not self.inspect(path)[0].is_dir:
+                raise MediaError(f"not a directory (symlinks are not followed): {path}")
+
+    def child(self, parent: str, name: str) -> Entry | None:
+        return next((e for e in self.inspect(parent)[1:] if e.name == name), None)
+
+    def bundle(self, name: str) -> str:
+        path = self.root + "/" + component(name) + ".config"
+        if not self.inspect(path)[0].is_dir:
+            raise MediaError(f"driver bundle is not a directory: {path}")
+        return path
+
+    def read(self, path: str, entry: Entry | None = None) -> bytes:
+        if entry is None:
+            entry = self.inspect(path)[0]
+        if not stat.S_ISREG(entry.mode):
+            raise MediaError(f"not a regular file: {path}")
+        data = self.nextufs("browse", "--raw", self.path, path)
+        if len(data) != entry.size:
+            raise MediaError(f"short read: {path}")
+        return data
+
+    def mutate(self, operation: str, path: str, *args: PathInput | int) -> None:
+        self.nextufs("mkfile", "--" + operation, self.path, path, *args)
+
+    def metadata(self, path: str, entry: Entry) -> None:
+        self.mutate("chown", path, entry.uid, entry.gid)
+        self.mutate("chmod", path, f"{stat.S_IMODE(entry.mode):o}")
+        self.mutate("utimes", path, entry.atime, entry.mtime)
+
+    def write(self, path: str, data: bytes, entry: Entry, exists: bool) -> None:
+        with tempfile.TemporaryDirectory(prefix="media-table-") as temp:
+            source = Path(temp) / "table"
+            source.write_bytes(data)
+            if exists:
+                self.mutate("unlink", path)
+            self.mutate("from-file", path, source)
+            self.metadata(path, entry)
+
+    def tree(self, path: str) -> list[Entry]:
+        result: list[Entry] = []
+        seen: set[int] = set()
+
+        def walk(current: str, relative: str, entry: Entry) -> None:
+            if not entry.is_dir and not stat.S_ISREG(entry.mode):
+                raise MediaError(f"unsupported symlink or special file: {current}")
+            result.append(replace(entry, name=relative))
+            if entry.is_dir:
+                if entry.inode in seen:
+                    raise MediaError(f"directory cycle at {current}")
+                seen.add(entry.inode)
+                for child in self.inspect(current)[1:]:
+                    walk(current + "/" + child.name,
+                         child.name if relative == "." else relative + "/" + child.name, child)
+        walk(path, ".", self.inspect(path)[0])
+        return result
+
+
+def local_stat(path: Path) -> os.stat_result:
+    entry = path.lstat()
+    if stat.S_ISLNK(entry.st_mode) or getattr(entry, "st_file_attributes", 0) & 0x400:
+        raise MediaError(f"symlinks and reparse points are not supported: {path}")
+    return entry
+
+
+@contextmanager
+def transaction(image: Image) -> Iterator[Image]:
+    """Commit only a successfully edited sibling copy; never mutate the input."""
+    original = local_stat(image.path)
+    if not stat.S_ISREG(original.st_mode) or original.st_nlink != 1:
+        raise MediaError("image must be a regular file with one hard link")
+    with image.path.open("rb") as source:
+        header = source.read(68)
+    if header[64:68] == b"\x7f\x10\xda\xbe":
+        raise MediaError("transactional writes support raw/labeled images, not VDI containers")
+    with tempfile.TemporaryDirectory(prefix=".media-", dir=image.path.parent) as temp:
+        copy = Path(temp) / "image.img"
+        shutil.copy2(image.path, copy)
+        staged = Image(image.binary, copy, image.root)
+        staged.check_root()
+        yield staged
+        current = local_stat(image.path)
+        def identity(s: os.stat_result) -> tuple[int, int, int, int, int]:
+            return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
+        if identity(current) != identity(original):
+            raise MediaError("image changed during the operation; refusing to replace it")
+        os.replace(copy, image.path)
+
+
+def host_component(name: str) -> None:
+    component(name)
+    if os.name == "nt" and (any(c in name for c in '<>:"|?*') or
+                            any(ord(c) < 32 for c in name) or
+                            name.endswith((".", " ")) or PureWindowsPath(name).is_reserved()):
+        raise MediaError(f"filename cannot be represented on this host: {name!r}")
+
+
+def _extract(image: Image, name: str, destination: PathInput) -> None:
+    bundle = image.bundle(name)
+    entries = image.tree(bundle)
+    destination = Path(destination).absolute()
+    if destination.exists() or destination.is_symlink():
+        raise MediaError(f"destination already exists: {destination}")
+    paths = set()
+    for entry in entries:
+        if os.path.normcase(entry.name) == os.path.normcase(MANIFEST):
+            raise MediaError(f"bundle uses reserved filename {MANIFEST}")
+        if entry.name != ".":
+            for part in entry.name.split("/"):
+                host_component(part)
+        key = os.path.normcase(entry.name)
+        if key in paths:
+            raise MediaError(f"filenames collide on this host: {entry.name}")
+        paths.add(key)
+    with tempfile.TemporaryDirectory(prefix=".media-extract-", dir=destination.parent) as temp:
+        staged = Path(temp) / "bundle"
+        for entry in entries:
+            target = staged / entry.name
+            if entry.is_dir:
+                target.mkdir()
+            else:
+                with target.open("xb") as output:
+                    output.write(image.read(bundle + "/" + entry.name, entry))
+        with (staged / MANIFEST).open("xb") as output:
+            output.write(records_json(entries))
+        # Metadata stays in the manifest, so read-only UFS directories remain editable locally.
+        if destination.exists() or destination.is_symlink():
+            raise MediaError(f"destination appeared during extraction: {destination}")
+        staged.rename(destination)
+
+
+def local_tree(source: PathInput) -> list[Entry]:
+    source = Path(source).absolute()
+    if not stat.S_ISDIR(local_stat(source).st_mode):
+        raise MediaError("local driver must be a directory")
+    saved: dict[str, Entry] = {}
+    manifest = source / MANIFEST
+    if manifest.exists() or manifest.is_symlink():
+        if not stat.S_ISREG(local_stat(manifest).st_mode):
+            raise MediaError("metadata manifest must be a regular file")
+        for entry in manifest_records(manifest.read_bytes()):
+            if entry.name != ".":
+                for part in entry.name.split("/"):
+                    component(part)
+            if entry.name in saved:
+                raise MediaError(f"duplicate manifest entry: {entry.name}")
+            saved[entry.name] = entry
+    result: list[Entry] = []
+
+    def walk(path: Path, relative: str) -> None:
+        info = local_stat(path)
+        if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+            raise MediaError(f"unsupported special file: {path}")
+        entry = saved.get(relative)
+        if entry is not None:
+            if stat.S_IFMT(entry.mode) != stat.S_IFMT(info.st_mode):
+                raise MediaError(f"file type differs from extraction manifest: {relative}")
+        else:
+            mode = stat.S_IFMT(info.st_mode) | (0o755 if stat.S_ISDIR(info.st_mode) else 0o644)
+            if os.name != "nt":
+                mode = info.st_mode
+            entry = Entry(0, mode, 0, 0, info.st_size, int(info.st_atime), int(info.st_mtime), relative)
+        result.append(entry)
+        if entry.is_dir:
+            for child in sorted(path.iterdir()):
+                if relative == "." and child.name == MANIFEST:
+                    continue
+                component(child.name)
+                walk(child, child.name if relative == "." else relative + "/" + child.name)
+    walk(source, ".")
+    return result
+
+
+def _store(image: Image, name: str, source: PathInput) -> None:
+    if name == "System":
+        raise MediaError("System.config may be configured, but not replaced")
+    source = Path(source).absolute()
+    entries = local_tree(source)
+    if image.child(image.root, name + ".config") is not None:
+        raise MediaError(f"{name}.config already exists; deactivate and remove it first")
+    bundle = image.root + "/" + name + ".config"
+    with tempfile.TemporaryDirectory(prefix="media-import-") as temp:
+        for entry in entries:
+            path = bundle if entry.name == "." else bundle + "/" + entry.name
+            if entry.is_dir:
+                image.mutate("mkdir", path)
+            else:
+                local = source / entry.name
+                if entry.name.endswith(".table"):
+                    # NXStringTable rejects CR outside quoted strings. Normalize
+                    # line endings without decoding or modifying the source bundle.
+                    data = local.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                    local = Path(temp) / "table"
+                    local.write_bytes(data)
+                image.mutate("from-file", path, local)
+    for entry in reversed(entries):
+        image.metadata(bundle if entry.name == "." else bundle + "/" + entry.name, entry)
+
+
+def system_table(image: Image) -> tuple[str, Table]:
+    path = image.bundle("System") + "/Instance0.table"
+    return path, Table(image.read(path))
+
+
+def _remove(image: Image, name: str) -> None:
+    if name == "System":
+        raise MediaError("System.config cannot be removed")
+    _, table = system_table(image)
+    if any(name in items for items in driver_lists(table)):
+        raise MediaError(f"{name} is active; deactivate it before removing it")
+    bundle = image.bundle(name)
+    for entry in reversed(image.tree(bundle)):
+        path = bundle if entry.name == "." else bundle + "/" + entry.name
+        image.mutate("rmdir" if entry.is_dir else "unlink", path)
+
+
+def _configure(image: Image, name: str, source_table: str, overwrite: bool,
+               settings: Mapping[str, str]) -> None:
+    bundle = image.bundle(name)
+    instance = image.child(bundle, "Instance0.table")
+    target = bundle + "/Instance0.table"
+    original = image.read(target, instance) if instance is not None else b""
+    if instance is None or overwrite:
+        source = bundle + "/" + source_table
+        template = image.inspect(source)[0]
+        data = image.read(source, template)
+        entry = instance or template
+    else:
+        data = original
+        entry = instance
+    table = Table(data)
+    for key, value in settings.items():
+        table.set(key, value)
+    if instance is None or original != table.data():
+        image.write(target, table.data(), entry, instance is not None)
+
+
+class DriverImage:
+    """Driver operations on one image, with no CLI parsing or console output.
+
+    Paths accept strings or os.PathLike objects. Each write is transactional;
+    sequences of calls are not a single transaction. Operational failures raise
+    MediaError (with the original exception chained for host I/O failures).
+    Construction resolves the executable but does not open or edit the image.
+    """
+
+    def __init__(self, image: PathInput, *,
+                 nextufs: PathInput | None = None, driver_root: str = ROOT) -> None:
+        self._image = Image(executable(nextufs), image, driver_root)
+
+    @contextmanager
+    def _operation(self, *, write: bool = False) -> Iterator[Image]:
+        try:
+            if write:
+                with transaction(self._image) as staged:
+                    yield staged
+            else:
+                self._image.check_root()
+                yield self._image
+        except (OSError, UnicodeError) as exc:
+            raise MediaError(str(exc)) from exc
+
+    def list_drivers(self) -> list[str]:
+        """Return sorted driver names, excluding System.config."""
+        with self._operation() as image:
+            return [driver_name(entry.name)
+                    for entry in sorted(image.inspect(image.root)[1:], key=lambda e: e.name)
+                    if entry.is_dir and entry.name.endswith(".config") and entry.name != "System.config"]
+
+    def extract(self, driver: str, destination: PathInput) -> None:
+        """Extract a bundle and its metadata into a new local directory."""
+        name = driver_name(driver)
+        with self._operation() as image:
+            _extract(image, name, destination)
+
+    def store(self, driver: str, source: PathInput) -> None:
+        """Store a local bundle, normalizing .table line endings to Unix LF.
+
+        Preserve source files and metadata; refuse to replace an existing bundle.
+        """
+        name = driver_name(driver)
+        with self._operation(write=True) as image:
+            _store(image, name, source)
+
+    def remove(self, driver: str) -> None:
+        """Remove an inactive bundle; System.config is protected."""
+        name = driver_name(driver)
+        with self._operation(write=True) as image:
+            _remove(image, name)
+
+    def configure(self, driver: str, *, source_table: str = "Default.table",
+                  overwrite: bool = False, settings: Mapping[str, str] | None = None) -> None:
+        """Create/edit Instance0.table using a mapping of keys to string values."""
+        name = driver_name(driver)
+        component(source_table)
+        if settings is None:
+            settings = {}
+        if not isinstance(settings, Mapping):
+            raise MediaError("settings must be a mapping of nonempty keys to string values")
+        settings = dict(settings)
+        for key, value in settings.items():
+            if not isinstance(key, str) or not key or not isinstance(value, str):
+                raise MediaError("settings must be a mapping of nonempty keys to string values")
+        with self._operation(write=True) as image:
+            _configure(image, name, source_table, overwrite, settings)
+
+    def activate(self, driver: str, *, dependencies: Iterable[str] = ()) -> None:
+        """Activate a configured driver after the named, already-active dependencies."""
+        name = driver_name(driver)
+        if isinstance(dependencies, (str, bytes)) or not isinstance(dependencies, Iterable):
+            raise MediaError("dependencies must be an iterable of driver names, not a string")
+        self._activation(name, [driver_name(dep) for dep in dependencies])
+
+    def deactivate(self, driver: str) -> None:
+        """Remove a driver from both lists, even if its bundle is missing."""
+        self._activation(driver_name(driver), None)
+
+    def _activation(self, name: str, dependencies: Iterable[str] | None) -> None:
+        if name == "System":
+            raise MediaError("System.config is not an activatable driver")
+        with self._operation(write=True) as image:
+            path, table = system_table(image)
+            before = table.data()
+            if dependencies is None:
+                deactivate(table, name)
+            else:
+                driver = Table(image.read(image.bundle(name) + "/Instance0.table"))
+                activate(table, name, driver.is_boot(), dependencies)
+            if before != table.data():
+                image.write(path, table.data(), image.inspect(path)[0], True)
+
+
+# Reusable image preparation and OPENSTEP/El Torito ISO construction.
+# Boot-CD workflow limits in KiB, including the front porch; not general UFS limits.
+MAX_GROWN_FLOPPY_KIB = 2560
+MAX_BOOT_FLOPPY_KIB = 2880
+
+
+def _subprocess_env(nextufs_binary: PathInput | None = None) -> dict[str, str] | None:
+    """Add the nextufs directory, containing its DLLs, to Windows child PATH."""
+    if sys.platform != "win32":
+        return None
+    runtime = Path(executable(nextufs_binary)).absolute().parent
+    env = os.environ.copy()
+    env["PATH"] = ";".join(filter(None, (str(runtime), env.get("PATH", ""))))
+    return env
+
+
+def nextufs(*args: PathInput | int, binary: PathInput | None = None) -> bytes:
+    """Run nextufs without printing; report command failures as MediaError."""
+    completed = subprocess.run([executable(binary), *map(str, args)], capture_output=True,
+                               env=_subprocess_env(binary))
+    if completed.returncode:
+        error = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise MediaError(error or f"nextufs exited with status {completed.returncode}")
+    return completed.stdout
+
+
+def grow_image(image: PathInput, size_kib: int, *,
+               nextufs_binary: PathInput | None = None) -> None:
+    """Grow a disposable image and its UFS in place to size_kib KiB."""
+    if size_kib <= 0:
+        raise ValueError("image size must be positive")
+    nextufs("resize", "grow", image, size_kib, binary=nextufs_binary)
+
+
+def check_image(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Run read-only fsck; raise MediaError on failure."""
+    nextufs("fsck", "-n", image, binary=nextufs_binary)
+
+
+def pad_image(image: PathInput, size_kib: int) -> None:
+    """Append zero padding in place without changing UFS geometry; never shrink."""
+    with Path(image).open("r+b") as stream:
+        if size_kib * 1024 < os.fstat(stream.fileno()).st_size:
+            raise ValueError("padding would shrink the image")
+        stream.truncate(size_kib * 1024)
+
+
+@dataclass(frozen=True)
+class DiskLabel:
+    name: str
+    version: int
+    offset: int
+    sector_size: int
+    front_porch_sectors: int
+    root_partition: str | None
+
+
+@dataclass(frozen=True)
+class FilesystemInfo:
+    magic: int
+    block_size: int
+    fragment_size: int
+    fragments_per_block: int
+    fragment_count: int
+    data_fragment_count: int
+    cylinder_groups: int
+    cylinders_per_group: int
+    inodes_per_group: int
+    fragments_per_group: int
+    free_blocks: int
+    free_fragments: int
+    free_inodes: int
+
+
+@dataclass(frozen=True)
+class ImageInfo:
+    """The nextufs info --json report, including its nested objects."""
+
+    source: str
+    source_kind: str
+    backing_bytes: int
+    image_bytes: int
+    slice_base: int
+    slice_bytes: int
+    superblock_base: int
+    filesystem_bytes: int
+    trailing_slice_slack: int
+    compatibility_ceiling_bytes: int
+    cylinder_summary_capacity_groups: int
+    used_disk_label: bool
+    label: DiskLabel
+    filesystem: FilesystemInfo
+
+    @classmethod
+    def from_json(cls, data: str | bytes) -> "ImageInfo":
+        try:
+            values = json.loads(data)
+            values["label"] = DiskLabel(**values["label"])
+            values["filesystem"] = FilesystemInfo(**values["filesystem"])
+            return cls(**values)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid nextufs info report: {exc}") from exc
+
+
+@contextmanager
+def new_output(output: PathInput, *, source: PathInput | None = None) -> Iterator[Path]:
+    """Stage a new output beside its destination; publish only on success."""
+    output = Path(output).absolute()
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"output already exists: {output}; refusing to overwrite it. Choose a different output path.")
+    with tempfile.TemporaryDirectory(prefix=".media-build-", dir=output.parent) as temp:
+        staged = Path(temp) / "image"
+        if source is not None:
+            shutil.copyfile(source, staged)
+        yield staged
+        try:
+            # Windows rename refuses to replace an existing destination. POSIX
+            # rename would overwrite it, so publish with an atomic hard link;
+            # temporary-directory cleanup removes the staging link afterward.
+            if sys.platform == "win32":
+                staged.rename(output)
+            else:
+                os.link(staged, output)
+        except FileExistsError as exc:
+            raise FileExistsError(f"output appeared during the operation: {output}; refusing to overwrite it.") from exc
+
+
+def skip_boot_language_selection(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Use the install bootloader's English fallback without disabling install mode.
+
+    pickLanguage() ignores System.config's Language setting in install mode.
+    Removing Language.table's Languages key selects English without a menu;
+    an empty or single-language value would still enter the menu code.
+    Keep the file and its other entries, and retain the installation confirmation.
+    """
+    with transaction(Image(executable(nextufs_binary), image)) as staged:
+        path = "/usr/standalone/i386/Language.table"
+        entry = staged.inspect(path)[0]
+        original = staged.read(path, entry)
+        table = Table(original)
+        table.remove("Languages")
+        if table.data() != original:
+            staged.write(path, table.data(), entry, exists=True)
+        if staged.read(path) != table.data():
+            raise ValueError("boot language table readback failed")
+
+
+def patch_pic_kernel(kernel: bytes) -> bytes:
+    """Fix spurious IRQ15 handling in the OPENSTEP 4.2 Intel kernel.
+
+    The kernel's interrupt handler returns from a spurious IRQ15 without an
+    end-of-interrupt (EOI) command. Although the slave 8259 PIC has no real
+    interrupt to acknowledge, the master PIC still has its cascade IRQ2 marked
+    in service. Leaving that bit set blocks further slave-PIC interrupts,
+    including IDE interrupts, and can hang disk probing or I/O.
+
+    Replace the spurious-interrupt counter increment with ``mov al, 0x62`` /
+    ``out 0x20, al``: a specific EOI for IRQ2 sent only to the master PIC.
+    Adjust the exit jump and pad with NOPs to keep the kernel size unchanged.
+    Retarget the spurious IRQ7 branch to skip this EOI, since a spurious
+    master-PIC interrupt needs no acknowledgement.
+
+    These two fixed-offset edits change 12 bytes in the original kernel.
+    Accept already-patched sites; reject unknown signatures or truncated input.
+    Patch source:
+    https://github.com/onionmixer/OPENSTEP-BOOTCD-INTEL/blob/master/04_tools/patch_kernel_pic.py
+    """
+    if kernel[:4] != bytes.fromhex("cefaedfe"):
+        raise ValueError("expected an i386 Mach-O kernel")
+    patched = bytearray(kernel)
+    for offset, oldhex, newhex in (
+        (0x8c70a, "7d0f", "7d13"),
+        (0x8c71b, "ff05d8691f00e9260100009090", "b062e620e92801000090909090"),
+    ):
+        old, new = bytes.fromhex(oldhex), bytes.fromhex(newhex)
+        if kernel[offset:offset + len(old)] not in (old, new):
+            raise ValueError(f"PIC patch signature mismatch at kernel offset {offset:#x}")
+        patched[offset:offset + len(new)] = new
+    return bytes(patched)
+
+
+def patch_kernel_pic_bug(source: PathInput, output: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Copy an image, patch /mach_kernel if needed, and replace it through nextufs.
+
+    Preserve kernel permissions, ownership and access/modification times.
+    Publish only after kernel readback and read-only fsck succeed.
+    """
+    with new_output(output, source=source) as staged:
+        image = Image(executable(nextufs_binary), staged)
+        entry = image.inspect("/mach_kernel")[0]
+        kernel = image.read("/mach_kernel", entry)
+        patched = patch_pic_kernel(kernel)
+        if patched != kernel:
+            image.write("/mach_kernel", patched, entry, exists=True)
+        if image.read("/mach_kernel") != patched:
+            raise ValueError("patched kernel readback failed")
+        check_image(staged, nextufs_binary=nextufs_binary)
+
+
+def _i386_kernel(kernel: bytes) -> bytes:
+    """Extract the Intel kernel from a legacy fat Mach-O, or accept a thin one."""
+    if kernel[:4] == bytes.fromhex("cafebabe"):
+        if len(kernel) < 8:
+            raise ValueError("truncated fat Mach-O header")
+        count = struct.unpack_from(">I", kernel, 4)[0]
+        end = 8 + count * 20
+        if end > len(kernel):
+            raise ValueError("truncated fat Mach-O architecture table")
+        architectures = [struct.unpack_from(">5I", kernel, pos) for pos in range(8, end, 20)]
+        intel = [arch for arch in architectures if arch[0] == 7]
+        if len(intel) != 1:
+            raise ValueError("expected exactly one i386 kernel in fat Mach-O")
+        _, _, offset, size, _ = intel[0]
+        if offset < end or size < 28 or offset + size > len(kernel):
+            raise ValueError("invalid i386 kernel extent in fat Mach-O")
+        kernel = kernel[offset:offset + size]
+    if (len(kernel) < 28 or kernel[:4] != bytes.fromhex("cefaedfe") or
+            struct.unpack_from("<I", kernel, 4)[0] != 7):
+        raise ValueError("expected an i386 Mach-O kernel")
+    return kernel
+
+
+_INSTALL_DRIVER_ARCHIVE = "/NextCD/BootDrivers.tar"
+_INSTALL_KERNEL = "/NextCD/mach_kernel.picfix"
+_INSTALL_DRIVER_ANCHOR = b'\n${SYNC}\n\necho\n${CHECKFLOP}'
+_INSTALL_DRIVER_HOOK = br'''
+# BEGIN quickstep boot drivers
+if [ "${ARCH}" = "i386" ]; then
+    echo "Installing boot-floppy drivers on the startup disk..."
+    if ${TAR} -xpf "${CDDIR}/BootDrivers.tar" -C "${HD}/usr/Devices"; then
+        echo "Boot-floppy drivers installed."
+    else
+        echo "Cannot install boot-floppy drivers; installation stopped."
+        exit 1
+    fi
+    echo "Configuring installed-system boot drivers..."
+    SYSTEM_CONFIG="${HD}/usr/Devices/System.config"
+    if [ -f "${SYSTEM_CONFIG}/Default.table" ]; then
+        # Instance tables take precedence over Default.table when present.
+        for TABLE_FILE in "${SYSTEM_CONFIG}/Default.table" "${SYSTEM_CONFIG}"/Instance[0-9]*.table
+        do
+            if [ -f "${TABLE_FILE}" ]; then
+                # Use legacy awk syntax: no -v option or ternary expressions.
+                if ${CP} -p "${TABLE_FILE}" "${TABLE_FILE}.quickstep" &&
+                    ${AWK} '
+                    BEGIN {
+                        boot = "@BOOT_DRIVERS@"
+                        count = split(boot, drivers, " ")
+                    }
+                    /^[ \t]*"Boot Drivers"[ \t]*=/ { next }
+                    /^[ \t]*"Active Drivers"[ \t]*=/ {
+                        split($0, fields, "\"")
+                        total = split(fields[4], active, " ")
+                        value = ""
+                        for (i = 1; i <= total; i++) {
+                            keep = 1
+                            for (j = 1; j <= count; j++)
+                                if (active[i] == drivers[j]) keep = 0
+                            if (keep) {
+                                if (value == "") value = active[i]
+                                else value = value " " active[i]
+                            }
+                        }
+                        printf "\"Active Drivers\" = \"%s\";\n", value
+                        next
+                    }
+                    { print }
+                    END { printf "\"Boot Drivers\" = \"%s\";\n", boot }
+                    ' "${TABLE_FILE}" > "${TABLE_FILE}.quickstep" &&
+                    ${MV} "${TABLE_FILE}.quickstep" "${TABLE_FILE}"; then
+                    echo "Configured boot drivers in ${TABLE_FILE}."
+                else
+                    echo "Cannot configure boot drivers in ${TABLE_FILE}; installation stopped."
+                    exit 1
+                fi
+            fi
+        done
+    else
+        echo "Missing installed System.config/Default.table; installation stopped."
+        exit 1
+    fi
+@PIC_HOOK@fi
+# END quickstep boot drivers
+'''
+_INSTALL_PIC_HOOK = br'''    echo "Installing PIC-patched kernel on the startup disk..."
+    if ${CP} -p "${CDDIR}/mach_kernel.picfix" "${HD}/mach_kernel"; then
+        echo "PIC-patched kernel installed."
+    else
+        echo "Cannot install PIC-patched kernel; installation stopped."
+        exit 1
+    fi
+'''
+
+
+def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_bug: bool = False) -> bytes:
+    """Install drivers and optionally a patched kernel before final sync and reboot."""
+    names = list(boot_drivers)
+    # These names are embedded in both a shell argument and an OPENSTEP table.
+    if not names or any(re.fullmatch(r"[A-Za-z0-9_.+-]+", name) is None for name in names):
+        raise ValueError("expected a nonempty list of safe boot-driver names")
+    hook = _INSTALL_DRIVER_HOOK.replace(b"@BOOT_DRIVERS@", " ".join(names).encode("ascii"))
+    hook = hook.replace(b"@PIC_HOOK@", _INSTALL_PIC_HOOK if fix_pic_bug else b"")
+    if script.count(_INSTALL_DRIVER_ANCHOR) != 1:
+        raise ValueError("unsupported rc.cdrom: expected one final sync/eject sequence")
+    if hook + _INSTALL_DRIVER_ANCHOR in script:
+        return script
+    if b"# BEGIN quickstep boot drivers" in script:
+        raise ValueError("rc.cdrom contains a different boot-driver hook")
+    return script.replace(_INSTALL_DRIVER_ANCHOR, hook + _INSTALL_DRIVER_ANCHOR, 1)
+
+
+def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = None) -> bytes:
+    """Package configured bundles, not the floppy's CD-only System.config."""
+    drivers = DriverImage(boot, nextufs=nextufs_binary)
+    image = Image(executable(nextufs_binary), boot)
+    names = drivers.list_drivers()
+    if not names:
+        raise ValueError("boot floppy has no driver bundles")
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name in names:
+            bundle = image.bundle(name)
+            entries = image.tree(bundle)
+            if not any(entry.name == "Default.table" for entry in entries):
+                raise ValueError(f"{name}.config has no Default.table")
+            instance = image.inspect(bundle + "/Instance0.table")[0]
+            configuration = image.read(bundle + "/Instance0.table", instance)
+            for entry in entries:
+                # The installed loader must use the same variant as the boot floppy.
+                # In particular, EIDE's generic Default.table is not its PIIX table.
+                if entry.name == "Default.table":
+                    entry = replace(instance, name="Default.table")
+                    data = configuration
+                else:
+                    data = b"" if entry.is_dir else image.read(bundle + "/" + entry.name, entry)
+                relative = name + ".config" + ("" if entry.name == "." else "/" + entry.name)
+                member = tarfile.TarInfo(relative)
+                member.mode, member.uid, member.gid = stat.S_IMODE(entry.mode), entry.uid, entry.gid
+                member.mtime = entry.mtime
+                member.type = tarfile.DIRTYPE if entry.is_dir else tarfile.REGTYPE
+                member.size = len(data)
+                archive.addfile(member, None if entry.is_dir else io.BytesIO(data))
+    return output.getvalue()
+
+
+def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: PathInput, *,
+                                 nextufs_binary: PathInput | None = None,
+                                 fix_pic_bug: bool = False) -> None:
+    """Prepare a User UFS installer with floppy drivers and an optional PIC fix.
+
+    Stage a legacy-compatible tar archive on the CD and patch rc.cdrom to unpack
+    it after base-system copying/configuration, before reboot. Keep the installer's
+    generated System.config and language settings, but replace its Boot Drivers
+    with the floppy's ordered list and remove those names from Active Drivers.
+    Update Default.table and any instance tables; do not copy CD-boot settings.
+    With fix_pic_bug, derive the installed kernel from the User CD, not the boot
+    floppy. Stage a thin, patched copy for rc.cdrom to install after ditto's
+    base-system copy; leave the CD's original /mach_kernel untouched.
+    Otherwise, leave kernel installation entirely to the original installer.
+    """
+    with new_output(output, source=user_ufs) as staged:
+        image = Image(executable(nextufs_binary), staged)
+        path = "/etc/rc.cdrom"
+        entry = image.inspect(path)[0]
+        _, system = system_table(Image(executable(nextufs_binary), boot))
+        script = _patch_cd_installer(image.read(path, entry), driver_lists(system)[0], fix_pic_bug=fix_pic_bug)
+        archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary)
+        for payload in (_INSTALL_DRIVER_ARCHIVE, _INSTALL_KERNEL):
+            if image.child("/NextCD", payload.rsplit("/", 1)[1]) is not None:
+                raise ValueError(f"User filesystem already contains {payload}")
+        metadata = replace(entry, mode=stat.S_IFREG | 0o644, size=len(archive))
+        image.write(_INSTALL_DRIVER_ARCHIVE, archive, metadata, exists=False)
+        if fix_pic_bug:
+            kernel_entry = image.inspect("/mach_kernel")[0]
+            kernel = patch_pic_kernel(_i386_kernel(image.read("/mach_kernel", kernel_entry)))
+            image.write(_INSTALL_KERNEL, kernel, replace(kernel_entry, size=len(kernel)), exists=False)
+            if image.read(_INSTALL_KERNEL) != kernel:
+                raise ValueError("installation kernel payload readback failed")
+        image.write(path, script, entry, exists=True)
+        if image.read(path) != script or image.read(_INSTALL_DRIVER_ARCHIVE) != archive:
+            raise ValueError("installation-driver payload readback failed")
+
+
+def image_info(image: PathInput, *, nextufs_binary: PathInput | None = None) -> ImageInfo:
+    """Inspect a raw or labeled UFS image without modifying it."""
+    return ImageInfo.from_json(nextufs("info", "--json", image, binary=nextufs_binary))
+
+
+def cd_layout(user_cd: PathInput, *, nextufs_binary: PathInput | None = None) -> ImageInfo:
+    """Inspect an OPENSTEP CD whose UFS starts immediately after its front porch."""
+    info = image_info(user_cd, nextufs_binary=nextufs_binary)
+    label = info.label
+    if (not info.used_disk_label or label.version != 0x646c5633 or
+            label.sector_size != 2048 or
+            info.slice_base != label.front_porch_sectors * 2048):
+        raise ValueError("expected a dlV3 User CD with its UFS slice immediately after the front porch")
+    return info
+
+
+def extract_ufs(image: PathInput, output: PathInput, *,
+                nextufs_binary: PathInput | None = None) -> ImageInfo:
+    """Copy a raw or labeled image's UFS slice to a new file; return its source layout."""
+    info = image_info(image, nextufs_binary=nextufs_binary)
+    with new_output(output) as staged, Path(image).open("rb") as source, staged.open("wb") as target:
+        source.seek(info.slice_base)
+        remaining = info.slice_bytes
+        while remaining:
+            data = source.read(min(1024 * 1024, remaining))
+            if not data:
+                raise ValueError("truncated UFS slice")
+            target.write(data)
+            remaining -= len(data)
+    return info
+
+
+def _directory(image: Image, path: str) -> Entry:
+    """Require an absolute directory path without traversing symlinks."""
+    if not path.startswith("/"):
+        raise ValueError(f"expected an absolute image directory: {path}")
+    current = ""
+    entry = image.inspect("/")[0]
+    for part in path.strip("/").split("/") if path != "/" else ():
+        current += "/" + component(part)
+        entry = image.inspect(current)[0]
+        if not entry.is_dir:
+            raise ValueError(f"not a directory: {current}")
+    return entry
+
+
+def _raw_ufs_info(path: PathInput, binary: PathInput | None) -> ImageInfo:
+    info = image_info(path, nextufs_binary=binary)
+    if (info.used_disk_label or info.slice_base != 0 or
+            info.filesystem_bytes != Path(path).stat().st_size):
+        raise ValueError("expected an unpadded raw UFS filesystem")
+    return info
+
+
+def _directory_capacity(image: Path, entries: list[Entry], binary: PathInput | None) -> None:
+    info = _raw_ufs_info(image, binary)
+    block = info.filesystem.block_size
+    required = sum(max(1, (entry.size + block - 1) // block) * block for entry in entries)
+    reserve = max(16 * 1024 * 1024, (required + 9) // 10)
+    while True:
+        fs = info.filesystem
+        free = fs.free_blocks * block + fs.free_fragments * fs.fragment_size
+        if free >= required + reserve and fs.free_inodes >= len(entries):
+            return
+        group = fs.fragments_per_group * fs.fragment_size
+        deficit = max(required + reserve - free, group)
+        size = ((info.filesystem_bytes + deficit + group - 1) // group) * group
+        if size > info.compatibility_ceiling_bytes:
+            raise ValueError("directory copy would exceed the OPENSTEP filesystem size limit")
+        print(f"Growing destination UFS to {size // 1024} KiB...", flush=True)
+        grow_image(image, size // 1024, nextufs_binary=binary)
+        info = _raw_ufs_info(image, binary)
+
+
+def copy_directory(source_image: PathInput, source_path: str, target_ufs: PathInput,
+                   target_path: str, output: PathInput, *,
+                   nextufs_binary: PathInput | None = None) -> None:
+    """Copy directory contents into a new raw UFS, growing it when necessary.
+
+    Existing destination directories retain their metadata; existing children
+    are never overwritten or merged. New directories and regular files retain
+    source metadata and bytes, with no format-specific transformations.
+    Symlinks and special files are unsupported. Inputs remain untouched.
+    """
+    print(f"Inspecting directory {source_path}...", flush=True)
+    if not target_path.startswith("/"):
+        raise ValueError(f"expected an absolute image directory: {target_path}")
+    binary = executable(nextufs_binary)
+    source = Image(binary, source_image)
+    source_root = _directory(source, source_path)
+    source_path, target_path = source_path.rstrip("/"), target_path.rstrip("/")
+    entries = source.tree(source_path or "/")
+    target = Image(binary, target_ufs)
+    parent, _, name = target_path.rpartition("/")
+    _directory(target, parent or "/")
+    existing = target.child(parent or "/", component(name)) if target_path else target.inspect("/")[0]
+    if existing is not None:
+        _directory(target, target_path or "/")
+        children = {entry.name for entry in target.inspect(target_path or "/")[1:]}
+        for entry in entries[1:]:
+            if entry.name.split("/", 1)[0] in children:
+                raise ValueError(f"destination already contains {target_path}/{entry.name}")
+    with new_output(output, source=target_ufs) as staged:
+        _directory_capacity(staged, entries, binary)
+        target = Image(binary, staged)
+        if existing is None:
+            target.mutate("mkdir", target_path)
+        for entry in entries[1:]:
+            if "/" not in entry.name:
+                print(f"Copying {source_path}/{entry.name} to {target_path}/{entry.name}...", flush=True)
+            path = target_path + "/" + entry.name
+            if entry.is_dir:
+                target.mutate("mkdir", path)
+            else:
+                target.write(path, source.read(source_path + "/" + entry.name, entry), entry, exists=False)
+        for entry in reversed(entries[1:]):
+            if entry.is_dir:
+                target.metadata(target_path + "/" + entry.name, entry)
+        target.metadata(target_path or "/", existing if existing is not None else source_root)
+        verify_directory_copy(source_image, source_path or "/", staged, target_path or "/",
+                              nextufs_binary=binary)
+
+
+def _verify_metadata(expected: Entry, actual: Entry, path: str) -> None:
+    """Compare portable metadata, excluding filesystem-local inode/allocation data."""
+    if ((expected.mode, expected.uid, expected.gid, expected.atime, expected.mtime) !=
+            (actual.mode, actual.uid, actual.gid, actual.atime, actual.mtime)):
+        raise ValueError(f"copied metadata differs: {path}")
+
+
+def verify_directory_copy(source_image: PathInput, source_path: str, target_image: PathInput,
+                          target_path: str, *, nextufs_binary: PathInput | None = None) -> None:
+    """Check copied contents and metadata; allow unrelated destination children.
+
+    The destination root's metadata is excluded because a pre-existing directory
+    retains its own metadata. Inode numbers and directory allocation sizes need
+    not match across filesystems.
+    """
+    print(f"Verifying copied directory {target_path}...", flush=True)
+    binary = executable(nextufs_binary)
+    source, target = Image(binary, source_image), Image(binary, target_image)
+    _directory(source, source_path)
+    _directory(target, target_path)
+    for entry in source.tree(source_path)[1:]:
+        path = target_path.rstrip("/") + "/" + entry.name
+        actual = target.inspect(path)[0]
+        _verify_metadata(entry, actual, path)
+        if not entry.is_dir and (actual.size != entry.size or
+                target.read(path, actual) != source.read(source_path.rstrip("/") + "/" + entry.name, entry)):
+            raise ValueError(f"copied file contents differ: {path}")
+
+
+@dataclass(frozen=True)
+class _TarEntry:
+    entry: Entry
+    member: tarfile.TarInfo | None
+
+
+def _tar_entries(archive: tarfile.TarFile) -> list[_TarEntry]:
+    """Validate the whole archive before writing, including implicit parents."""
+    entries: dict[str, _TarEntry] = {}
+    seen: set[str] = set()
+    for member in archive.getmembers():
+        if not (member.isdir() or member.isfile()) or member.issparse():
+            raise ValueError(f"unsupported tar entry type: {member.name}")
+        name = member.name
+        if name.startswith("/") or PureWindowsPath(name).drive:
+            raise ValueError(f"absolute tar path: {name}")
+        while name.startswith("./"):
+            name = name[2:]
+        name = name.rstrip("/") if member.isdir() else name
+        if name in seen:
+            raise ValueError(f"duplicate tar entry: {name}")
+        seen.add(name)
+        if name in ("", ".") and member.isdir():
+            continue  # The existing destination root keeps its metadata.
+        parts = name.split("/")
+        for part in parts:
+            component(part)
+        timestamp = int(member.mtime)
+        if (member.size < 0 or not 0 <= timestamp <= 0xffffffff or
+                not 0 <= member.uid <= 0xffff or not 0 <= member.gid <= 0xffff):
+            raise ValueError(f"tar metadata cannot be represented in OPENSTEP UFS: {name}")
+        mode = (stat.S_IFDIR if member.isdir() else stat.S_IFREG) | stat.S_IMODE(member.mode)
+        entry = Entry(0, mode, member.uid, member.gid, member.size, timestamp, timestamp, name)
+        previous = entries.get(name)
+        if previous is not None and previous.entry.is_dir and not entry.is_dir:
+            raise ValueError(f"tar file is also used as a parent directory: {name}")
+        entries[name] = _TarEntry(entry, member)
+        for depth in range(1, len(parts)):
+            parent = "/".join(parts[:depth])
+            previous = entries.get(parent)
+            if previous is not None and not previous.entry.is_dir:
+                raise ValueError(f"tar parent is not a directory: {parent}")
+            if previous is None:
+                entries[parent] = _TarEntry(replace(entry, name=parent, mode=stat.S_IFDIR | 0o755, size=0), None)
+    return sorted(entries.values(), key=lambda item: (item.entry.name.count("/"), item.entry.name))
+
+
+def _tar_read(archive: tarfile.TarFile, item: _TarEntry) -> bytes:
+    if item.member is None or not item.member.isfile():
+        raise ValueError(f"not an archived regular file: {item.entry.name}")
+    stream = archive.extractfile(item.member)
+    if stream is None:
+        raise ValueError(f"cannot read tar entry: {item.entry.name}")
+    with stream:
+        data = stream.read()
+    if len(data) != item.entry.size:
+        raise ValueError(f"truncated tar entry: {item.entry.name}")
+    return data
+
+
+def tar_entries(archive: PathInput) -> list[Entry]:
+    """Inspect validated archive entries, including implicit parent directories."""
+    with tarfile.open(archive, "r:*") as source:
+        return [item.entry for item in _tar_entries(source)]
+
+
+def copy_tar(archive: PathInput, target_ufs: PathInput, target_path: str, output: PathInput, *,
+             nextufs_binary: PathInput | None = None) -> None:
+    """Import a tar into an existing directory in a new, automatically grown UFS.
+
+    Preserve bytes, modes, ownership and mtime; use mtime for atime. Missing
+    parent directories use mode 0755 and their first child's ownership/mtime.
+    Reject collisions, unsafe names, links and special files. No host extraction,
+    script execution or interpretation of nested archives is performed.
+    """
+    print(f"Inspecting archive {archive}...", flush=True)
+    binary = executable(nextufs_binary)
+    with tarfile.open(archive, "r:*") as source:
+        entries = _tar_entries(source)
+        target = Image(binary, target_ufs)
+        root = _directory(target, target_path)
+        target_path = target_path.rstrip("/")
+        children = {entry.name for entry in target.inspect(target_path or "/")[1:]}
+        for item in entries:
+            if item.entry.name.split("/", 1)[0] in children:
+                raise ValueError(f"destination already contains {target_path}/{item.entry.name}")
+        with new_output(output, source=target_ufs) as staged:
+            _directory_capacity(staged, [item.entry for item in entries], binary)
+            target = Image(binary, staged)
+            for item in entries:
+                path = target_path + "/" + item.entry.name
+                if "/" not in item.entry.name:
+                    print(f"Copying {item.entry.name} from {archive} to {path}...", flush=True)
+                if item.entry.is_dir:
+                    target.mutate("mkdir", path)
+                else:
+                    target.write(path, _tar_read(source, item), item.entry, exists=False)
+            for item in reversed(entries):
+                if item.entry.is_dir:
+                    target.metadata(target_path + "/" + item.entry.name, item.entry)
+            target.metadata(target_path or "/", root)
+            verify_tar_copy(archive, staged, target_path or "/", nextufs_binary=binary)
+
+
+def verify_tar_copy(archive: PathInput, target_image: PathInput, target_path: str, *,
+                    nextufs_binary: PathInput | None = None) -> None:
+    """Compare imported archive contents and metadata through a raw UFS or ISO."""
+    print(f"Verifying {archive}...", flush=True)
+    target = Image(executable(nextufs_binary), target_image)
+    _directory(target, target_path)
+    with tarfile.open(archive, "r:*") as source:
+        for item in _tar_entries(source):
+            entry = item.entry
+            path = target_path.rstrip("/") + "/" + entry.name
+            actual = target.inspect(path)[0]
+            _verify_metadata(entry, actual, path)
+            if not entry.is_dir and (actual.size != entry.size or target.read(path, actual) != _tar_read(source, item)):
+                raise ValueError(f"imported tar file contents differ: {path}")
+
+
+def resolve_iso_tool(tool: PathInput | None = None, *,
+                     nextufs_binary: PathInput | None = None) -> str:
+    """Resolve a mkisofs-compatible executable before starting expensive work."""
+    env = _subprocess_env(nextufs_binary)
+    search_path = env["PATH"] if env is not None else None
+    executable = shutil.which(os.fspath(tool), path=search_path) if tool else next(
+        (found for name in ("mkisofs", "genisoimage", "xorriso")
+         if (found := shutil.which(name, path=search_path))), None)
+    if not executable:
+        if tool is not None:
+            raise FileNotFoundError(f"ISO tool executable not found: {tool}")
+        raise FileNotFoundError("install mkisofs, genisoimage, or xorriso, or pass --iso-tool PATH")
+    return str(Path(executable).absolute())
+
+
+def iso_command(boot: PathInput, ufs: PathInput, output: PathInput,
+                tool: PathInput | None = None, *, volume_id: str = "OPENSTEP",
+                nextufs_binary: PathInput | None = None) -> list[str]:
+    """Use the common mkisofs interface, with floppy emulation (not no-emulation)."""
+    executable = resolve_iso_tool(tool, nextufs_binary=nextufs_binary)
+    command = [executable]
+    if Path(executable).stem.lower() == "xorriso":
+        command += ["-as", "mkisofs"]
+    return command + ["-iso-level", "3", "-V", volume_id,
+                      "-b", "000BOOT.IMG", "-c", "BOOT.CAT", "-boot-load-size", "1",
+                      "-o", os.fspath(output), "-graft-points",
+                      "000BOOT.IMG=" + Path(boot).as_posix(),
+                      "USER.UFS=" + Path(ufs).as_posix()]
+
+
+@dataclass(frozen=True)
+class IsoLayout:
+    boot_lba: int
+    ufs_lba: int
+    catalog_lba: int
+    ufs_bytes: int
+
+
+def iso_layout(path: PathInput) -> IsoLayout:
+    """Read only the ISO root entries and BIOS boot catalog needed by this builder."""
+    with Path(path).open("rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+
+        def read(offset: int, count: int) -> bytes:
+            if offset < 0 or count < 0 or offset + count > size:
+                raise ValueError("ISO extent lies outside the image")
+            stream.seek(offset)
+            data = stream.read(count)
+            if len(data) != count:
+                raise ValueError("truncated ISO")
+            return data
+
+        root = None
+        catalog_lba = None
+        for sector in range(16, 80):
+            descriptor = read(sector * 2048, 2048)
+            if descriptor[1:7] != b"CD001\x01":
+                raise ValueError("invalid ISO volume descriptor")
+            if descriptor[0] == 1:
+                if struct.unpack_from("<H", descriptor, 128)[0] != 2048:
+                    raise ValueError("expected 2048-byte ISO sectors")
+                root = descriptor[156:190]
+            elif descriptor[0] == 0 and descriptor[7:39].rstrip(b"\0 ") == b"EL TORITO SPECIFICATION":
+                catalog_lba = struct.unpack_from("<I", descriptor, 71)[0]
+            elif descriptor[0] == 255:
+                break
+        if root is None or catalog_lba is None:
+            raise ValueError("missing primary volume descriptor or El Torito boot record")
+
+        def extent(record: bytes) -> tuple[int, int]:
+            lba = struct.unpack_from("<I", record, 2)[0]
+            length = struct.unpack_from("<I", record, 10)[0]
+            if (lba != struct.unpack_from(">I", record, 6)[0] or
+                    length != struct.unpack_from(">I", record, 14)[0]):
+                raise ValueError("inconsistent ISO directory extent")
+            if lba * 2048 + length > size:
+                raise ValueError("ISO directory extent lies outside the image")
+            return lba, length
+
+        root_lba, root_size = extent(root)
+        if root_size > 1024 * 1024:
+            raise ValueError("unexpectedly large ISO root directory")
+        directory = read(root_lba * 2048, root_size)
+        entries = {}
+        offset = 0
+        while offset < len(directory):
+            length = directory[offset]
+            if not length:
+                offset = (offset // 2048 + 1) * 2048
+                continue
+            record = directory[offset:offset + length]
+            if length < 34 or len(record) != length or 33 + record[32] > length:
+                raise ValueError("invalid ISO directory record")
+            if not record[25] & 2:
+                name = record[33:33 + record[32]]
+                if record[25] & 128 or name in entries:
+                    raise ValueError("unexpected multi-extent or duplicate ISO file")
+                entries[name] = extent(record)
+            offset += length
+        try:
+            boot_lba, boot_size = entries[b"000BOOT.IMG;1"]
+            ufs_lba, ufs_bytes = entries[b"USER.UFS;1"]
+            cat_lba, _ = entries[b"BOOT.CAT;1"]
+        except KeyError as exc:
+            raise ValueError(f"missing ISO file: {exc}") from exc
+        if boot_size != MAX_BOOT_FLOPPY_KIB * 1024 or cat_lba != catalog_lba:
+            raise ValueError("invalid boot image size or catalog location")
+        catalog = read(catalog_lba * 2048, 2048)
+        if (catalog[:2] != b"\x01\x00" or catalog[30:32] != b"\x55\xaa" or
+                sum(struct.unpack("<16H", catalog[:32])) & 0xffff or
+                catalog[32:34] != b"\x88\x03" or
+                struct.unpack_from("<H", catalog, 38)[0] != 1 or
+                struct.unpack_from("<I", catalog, 40)[0] != boot_lba):
+            raise ValueError("expected a valid BIOS 2.88 MiB floppy catalog with one load sector")
+    return IsoLayout(boot_lba, ufs_lba, catalog_lba, ufs_bytes)
+
+
+def create_iso(boot: PathInput, user_cd: PathInput, ufs: PathInput, output: PathInput, *,
+               volume_id: str = "OPENSTEP", iso_tool: PathInput | None = None,
+               nextufs_binary: PathInput | None = None) -> IsoLayout:
+    """Combine BIOS floppy booting and OPENSTEP's native UFS CD discovery.
+
+    The BIOS uses the ISO's El Torito catalog to load the floppy image.
+    OPENSTEP instead uses a NeXT label in the ISO system area to locate the
+    User UFS payload. Both views must point at the extents actually allocated
+    by the ISO tool; the ISO filesystem alone is not enough for OPENSTEP.
+    """
+    boot, user_cd, ufs = map(Path, (boot, user_cd, ufs))
+    with new_output(output) as staged:
+        if boot.stat().st_size != MAX_BOOT_FLOPPY_KIB * 1024:
+            raise ValueError(f"boot image must be exactly {MAX_BOOT_FLOPPY_KIB} KiB")
+        label_info = cd_layout(user_cd, nextufs_binary=nextufs_binary)
+        ufs_info = _raw_ufs_info(ufs, nextufs_binary)
+
+        # 1. Copy inputs under fixed ISO names. Relative paths avoid Windows
+        # drive-letter parsing differences in mkisofs-compatible programs.
+        stage = staged.parent
+        staged_boot, staged_ufs = stage / "000BOOT.IMG", stage / "USER.UFS"
+        shutil.copyfile(boot, staged_boot)
+        shutil.copyfile(ufs, staged_ufs)
+
+        # 2. Build the ISO and its BIOS boot catalog in floppy-emulation mode.
+        # The one-sector initial load preserves the stock floppy boot protocol.
+        command = iso_command(staged_boot.name, staged_ufs.name, staged.name, iso_tool,
+                              volume_id=volume_id, nextufs_binary=nextufs_binary)
+        completed = subprocess.run(command, cwd=stage, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   env=_subprocess_env(nextufs_binary))
+        if completed.returncode:
+            detail = completed.stdout.decode("utf-8", errors="replace").strip()
+            message = f"ISO tool {command[0]} failed with exit status {completed.returncode}"
+            raise MediaError(message + (f":\n{detail}" if detail else ""))
+
+        # 3. Read the generated directory extents and validate the boot catalog.
+        # Different ISO tools may place the boot image and User UFS differently.
+        layout = iso_layout(staged)
+
+        # 4. Add OPENSTEP's view of the disc in the reserved ISO system area.
+        # Rebase the original NeXT label to USER.UFS and recompute its checksum.
+        _hybrid_label(user_cd, staged, layout.ufs_lba, label_info.label.offset, ufs_info.filesystem_bytes)
+        _check_iso_ufs(staged, layout, ufs_info, nextufs_binary)
+
+        # 5. Check both embedded payloads before new_output publishes the ISO.
+        # The label write must not alter the floppy or the User filesystem.
+        check_payload(staged, layout.boot_lba, staged_boot)
+        check_payload(staged, layout.ufs_lba, staged_ufs)
+    return layout
+
+
+def _hybrid_label(user_cd: PathInput, output: Path, ufs_lba: int, label_offset: int, ufs_bytes: int) -> None:
+    if not 0 <= ufs_lba <= 0xffff:
+        raise ValueError("User UFS lies beyond the NeXT label's front-porch field")
+    with Path(user_cd).open("rb") as source:
+        source.seek(label_offset)
+        label = bytearray(source.read(7680))
+    if len(label) != 7680 or label[:4] != b"dlV3":
+        raise ValueError("missing or truncated dlV3 label")
+    root = label[0xbc] - ord("a")
+    if not 0 <= root < 8 or struct.unpack_from(">H", label, 0x5e)[0] != 2048:
+        raise ValueError("expected a root partition and 2048-byte CD sectors")
+    part = 0xc0 + root * 0x40
+    if label[part:part + 3] != b"\0\0\0":
+        raise ValueError("expected a root partition immediately after the front porch")
+    if ufs_bytes <= 0 or ufs_bytes % 2048 or ufs_bytes // 2048 >= 0xffffff:
+        raise ValueError("User UFS size cannot be represented in the CD partition label")
+    label[part + 3:part + 6] = (ufs_bytes // 2048).to_bytes(3, "big")
+    # Relocate this label copy to block zero and the partition's front porch
+    # to the new UFS extent. Only the root partition's size changes above;
+    # unrelated geometry and partition data survive.
+    struct.pack_into(">I", label, 4, 0)
+    struct.pack_into(">H", label, 0x70, ufs_lba)
+    checksum = sum(struct.unpack(">279H", label[:0x22e]))
+    while checksum >> 16:
+        checksum = (checksum & 0xffff) + (checksum >> 16)
+    struct.pack_into(">H", label, 0x22e, checksum)
+    with output.open("r+b") as target:
+        target.write(label)
+
+
+def _check_iso_ufs(iso: PathInput, layout: IsoLayout, prepared: ImageInfo,
+                   binary: PathInput | None) -> None:
+    embedded = cd_layout(iso, nextufs_binary=binary)
+    if (embedded.slice_base != layout.ufs_lba * 2048 or
+            not (layout.ufs_bytes == prepared.filesystem_bytes == embedded.slice_bytes ==
+                 embedded.filesystem_bytes) or embedded.filesystem != prepared.filesystem):
+        raise ValueError("ISO UFS extent, hybrid partition label, or filesystem differs from prepared UFS")
+
+
+def check_payload(iso: PathInput, lba: int, source: PathInput) -> None:
+    """Compare a file against an image extent addressed in 2048-byte sectors."""
+    iso, source = map(Path, (iso, source))
+    with iso.open("rb") as image, source.open("rb") as original:
+        image.seek(lba * 2048)
+        remaining = source.stat().st_size
+        while remaining:
+            count = min(1024 * 1024, remaining)
+            expected = original.read(count)
+            if len(expected) != count or image.read(count) != expected:
+                raise ValueError(f"ISO payload differs from {source}")
+            remaining -= count
+
+
+def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
+                   ufs: PathInput, iso: PathInput, *, nextufs_binary: PathInput | None = None,
+                   installation_drivers: bool = False, fix_pic_bug: bool = False) -> None:
+    """Check bootloader, El Torito payloads, User UFS, and installer access.
+
+    Read-only verification, including fsck of the prepared floppy; this does not
+    establish that the ISO boots successfully in a VM. With installation_drivers,
+    verify the installer hook, driver archive and optional patched kernel instead
+    of requiring the embedded User UFS to be byte-identical to the original CD.
+    """
+    boot_disk, boot, user_cd, ufs, iso = map(Path, (boot_disk, boot, user_cd, ufs, iso))
+    with boot_disk.open("rb") as source, boot.open("rb") as prepared:
+        original, grown = source.read(65536), prepared.read(65536)
+    if len(original) != 65536 or boot.stat().st_size != MAX_BOOT_FLOPPY_KIB * 1024:
+        raise ValueError(f"expected an original boot floppy and a {MAX_BOOT_FLOPPY_KIB} KiB boot image")
+    # Resizing may update the three disk labels, but not the bootloader between them.
+    for offset, (old, new) in enumerate(zip(original, grown)):
+        if old != new and not any(label <= offset < label + 0x300 for label in (7680, 15360, 23040)):
+            raise ValueError("bootloader bytes changed")
+    layout = iso_layout(iso)
+    check_payload(iso, layout.boot_lba, boot)
+    check_payload(iso, layout.ufs_lba, ufs)
+    user_layout = cd_layout(user_cd, nextufs_binary=nextufs_binary)
+    _check_iso_ufs(iso, layout, _raw_ufs_info(ufs, nextufs_binary), nextufs_binary)
+    original_script = nextufs("browse", "--raw", user_cd, "/etc/rc.cdrom", binary=nextufs_binary)
+    if installation_drivers:
+        _, system = system_table(Image(executable(nextufs_binary), boot))
+        expected_script = _patch_cd_installer(original_script, driver_lists(system)[0], fix_pic_bug=fix_pic_bug)
+        archive = nextufs("browse", "--raw", iso, _INSTALL_DRIVER_ARCHIVE, binary=nextufs_binary)
+        if archive != _boot_driver_archive(boot, nextufs_binary=nextufs_binary):
+            raise ValueError("installation drivers differ from the boot floppy")
+        original_kernel = nextufs("browse", "--raw", user_cd, "/mach_kernel", binary=nextufs_binary)
+        if nextufs("browse", "--raw", iso, "/mach_kernel", binary=nextufs_binary) != original_kernel:
+            raise ValueError("User CD kernel changed")
+        if fix_pic_bug:
+            expected_kernel = patch_pic_kernel(_i386_kernel(original_kernel))
+            if nextufs("browse", "--raw", iso, _INSTALL_KERNEL, binary=nextufs_binary) != expected_kernel:
+                raise ValueError("installation kernel differs from the PIC-patched User CD Intel kernel")
+        elif Image(executable(nextufs_binary), iso).child("/NextCD", "mach_kernel.picfix") is not None:
+            raise ValueError("unexpected PIC-patched installation kernel without fix_pic_bug")
+    else:
+        check_payload(user_cd, user_layout.slice_base // 2048, ufs)
+        expected_script = original_script
+    installer = nextufs("browse", "--raw", iso, "/etc/rc.cdrom", binary=nextufs_binary)
+    if installer != expected_script:
+        raise ValueError("installer script differs when read through the hybrid label")
+    check_image(boot, nextufs_binary=nextufs_binary)
