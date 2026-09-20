@@ -40,6 +40,8 @@ python3 build_cd.py \
 - `--developer-cd /path/to/Developer.iso`: include the Developer CD packages.
 - `--user-patch /path/to/OS42MachUserPatch4.tar`: include User Patch 4.
 - `--developer-patch /path/to/OS42MachDevPatch4.tar`: include Developer Patch 4.
+- `--remove-language-packages`: remove additional language packages and their receipt entries from the generated CD.
+  English and existing localized files in the base system are retained.
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.
 - `--nextufs /path/to/nextufs`: select the nextufs executable explicitly.
 - `--iso-tool /path/to/xorriso`: select an ISO tool explicitly (`mkisofs`, `genisoimage`, or `xorriso`).
@@ -50,3 +52,4 @@ Manually installing User Patch 4 replaces the installed kernel.
 If you built with `--fix-pic-bug`, run `/usr/bin/fix-pic-bug` as root after installing the patch and before rebooting.
 The helper supports stock OPENSTEP 4.2 and Patch 4 kernels, leaves already-patched kernels unchanged, and refuses unknown kernels.
 It saves the original as `/mach_kernel.pre-pic-fix` without overwriting an existing backup.
+The package itself is not modified.

@@ -93,7 +93,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           user_cd: PathInput, output: PathInput, *, iso_tool: PathInput | None = None,
           nextufs_binary: PathInput | None = None, bus_master_ide: PathInput | None = None,
           fix_pic_bug: bool = False, developer_cd: PathInput | None = None,
-          user_patch: PathInput | None = None, developer_patch: PathInput | None = None) -> None:
+          user_patch: PathInput | None = None, developer_patch: PathInput | None = None,
+          remove_language_packages: bool = False) -> None:
     """Build and check the complete ISO; keep intermediates only until publication."""
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
@@ -126,6 +127,11 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                 bus_master_ide=bus_master_ide)
         print(f"Extracting User CD filesystem from {user_cd}...", flush=True)
         media.extract_ufs(user_cd, ufs, nextufs_binary=nextufs_binary)
+        if remove_language_packages:
+            print("Removing optional non-English language packages and receipts...", flush=True)
+            pruned = iso.parent / "english.ufs"
+            media.remove_language_packages(ufs, pruned, nextufs_binary=nextufs_binary)
+            ufs = pruned
         if fix_pic_bug:
             print("Applying kernel PIC fix if needed...", flush=True)
             patched = iso.parent / "boot-picfix.img"
@@ -181,6 +187,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--developer-patch", type=Path, help="OS42MachDevPatch4.tar to include for manual installation")
     parser.add_argument("--fix-pic-bug", action="store_true",
                         help="apply the PIC interrupt fix to the boot and installed kernels")
+    parser.add_argument("--remove-language-packages", action="store_true",
+                        help="omit French, German, Italian, Spanish and Swedish Essentials packages and receipts")
     parser.add_argument("--beta-disk", type=Path,
                         help="beta-driver floppy (required unless --bus-master-ide is provided)")
     parser.add_argument("--bus-master-ide", type=Path, metavar="BusMasterIDE.config",
@@ -192,7 +200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         build(boot_disk=args.boot_disk, driver_disk=args.driver_disk, beta_disk=args.beta_disk,
               user_cd=args.user_cd, output=args.output, iso_tool=args.iso_tool, nextufs_binary=args.nextufs,
               bus_master_ide=args.bus_master_ide, fix_pic_bug=args.fix_pic_bug, developer_cd=args.developer_cd,
-              user_patch=args.user_patch, developer_patch=args.developer_patch)
+              user_patch=args.user_patch, developer_patch=args.developer_patch,
+              remove_language_packages=args.remove_language_packages)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"build_cd.py: {exc}\n")
     return 0

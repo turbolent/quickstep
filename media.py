@@ -30,6 +30,7 @@ __all__ = [
     "check_image", "pad_image", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
     "prepare_installation_drivers", "verify_boot_cd",
     "skip_boot_language_selection",
+    "remove_language_packages",
     "copy_directory", "verify_directory_copy",
     "copy_tar", "verify_tar_copy", "tar_entries",
     "MAX_GROWN_FLOPPY_KIB", "MAX_BOOT_FLOPPY_KIB",
@@ -1093,6 +1094,46 @@ def _directory(image: Image, path: str) -> Entry:
         if not entry.is_dir:
             raise ValueError(f"not a directory: {current}")
     return entry
+
+
+def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
+                             nextufs_binary: PathInput | None = None) -> None:
+    """Copy a User UFS without the five optional non-English Essentials packages.
+
+    Remove both payload bundles and their receipt entries, which the installer
+    uses as its package inventory. English is part of BaseSystem, not a separate
+    package. Leave localized files in the base filesystem and all other packages
+    alone. Missing packages are allowed, so an already-pruned image is valid.
+    """
+    packages = {language + "Essentials.pkg" for language in
+                ("French", "German", "Italian", "Spanish", "Swedish")}
+    binary = executable(nextufs_binary)
+    _raw_ufs_info(user_ufs, binary)
+    source = Image(binary, user_ufs)
+    parents: list[tuple[str, Entry]] = []
+    trees: list[tuple[str, list[Entry]]] = []
+    # Validate every target before editing the staged copy. Refuse symlinks,
+    # including in parent paths, rather than following them outside a bundle.
+    for parent in ("/NextCD/Packages", "/NextLibrary/Receipts"):
+        parents.append((parent, _directory(source, parent)))
+        for entry in source.inspect(parent)[1:]:
+            if entry.name in packages:
+                path = parent + "/" + entry.name
+                _directory(source, path)
+                trees.append((path, source.tree(path)))
+    with new_output(output, source=user_ufs) as staged:
+        target = Image(binary, staged)
+        for root, entries in trees:
+            print(f"Removing {root}...", flush=True)
+            for entry in reversed(entries):
+                path = root if entry.name == "." else root + "/" + entry.name
+                target.mutate("rmdir" if entry.is_dir else "unlink", path)
+        print("Verifying language-package removal...", flush=True)
+        for parent, entry in parents:
+            target.metadata(parent, entry)
+            expected = {child.name for child in source.inspect(parent)[1:]} - packages
+            if {child.name for child in target.inspect(parent)[1:]} != expected:
+                raise ValueError(f"package inventory differs after removal: {parent}")
 
 
 def _raw_ufs_info(path: PathInput, binary: PathInput | None) -> ImageInfo:
