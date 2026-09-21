@@ -652,11 +652,15 @@ def _subprocess_env(nextufs_binary: PathInput | None = None) -> dict[str, str] |
 
 def nextufs(*args: PathInput | int, binary: PathInput | None = None) -> bytes:
     """Run nextufs without printing; report command failures as MediaError."""
-    completed = subprocess.run([executable(binary), *map(str, args)], capture_output=True,
+    command = [executable(binary), *map(str, args)]
+    completed = subprocess.run(command, capture_output=True,
                                env=_subprocess_env(binary))
     if completed.returncode:
-        error = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise MediaError(error or f"nextufs exited with status {completed.returncode}")
+        # fsck writes its errors to stdout, whereas other subcommands use stderr.
+        details = "\n".join(part.decode("utf-8", errors="replace").strip()
+                            for part in (completed.stdout, completed.stderr) if part.strip())
+        error = f"nextufs {' '.join(command[1:])} exited with status {completed.returncode}"
+        raise MediaError(error + (f":\n{details}" if details else ""))
     return completed.stdout
 
 
@@ -882,7 +886,7 @@ _INSTALL_DRIVER_ANCHOR = b'\n${SYNC}\n\necho\n${CHECKFLOP}'
 _INSTALL_DRIVER_HOOK = br'''
 # BEGIN quickstep boot drivers
 if [ "${ARCH}" = "i386" ]; then
-    echo "Installing boot-floppy drivers on the startup disk..."
+@PACKAGE_HOOK@    echo "Installing boot-floppy drivers on the startup disk..."
     if ${TAR} -xpf "${CDDIR}/BootDrivers.tar" -C "${HD}/usr/Devices"; then
         echo "Boot-floppy drivers installed."
     else
@@ -955,7 +959,8 @@ _INSTALL_PIC_HOOK = br'''    echo "Installing PIC-patched kernel on the startup 
 '''
 
 
-def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_bug: bool = False) -> bytes:
+def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_bug: bool = False,
+                        package_hook: bytes = b"") -> bytes:
     """Install drivers and optionally a patched kernel/helper before final reboot."""
     names = list(boot_drivers)
     # These names are embedded in both a shell argument and an OPENSTEP table.
@@ -963,6 +968,7 @@ def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_b
         raise ValueError("expected a nonempty list of safe boot-driver names")
     hook = _INSTALL_DRIVER_HOOK.replace(b"@BOOT_DRIVERS@", " ".join(names).encode("ascii"))
     hook = hook.replace(b"@PIC_HOOK@", _INSTALL_PIC_HOOK if fix_pic_bug else b"")
+    hook = hook.replace(b"@PACKAGE_HOOK@", package_hook)
     if script.count(_INSTALL_DRIVER_ANCHOR) != 1:
         raise ValueError("unsupported rc.cdrom: expected one final sync/eject sequence")
     if hook + _INSTALL_DRIVER_ANCHOR in script:
@@ -972,11 +978,15 @@ def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_b
     return script.replace(_INSTALL_DRIVER_ANCHOR, hook + _INSTALL_DRIVER_ANCHOR, 1)
 
 
-def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = None) -> bytes:
+def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = None,
+                         packaged_drivers: Iterable[str] = ()) -> bytes:
     """Package configured bundles, not the floppy's CD-only System.config."""
     drivers = DriverImage(boot, nextufs=nextufs_binary)
     image = Image(executable(nextufs_binary), boot)
     names = drivers.list_drivers()
+    packaged = set(packaged_drivers)
+    if not packaged <= set(names):
+        raise ValueError("packaged driver is missing from the boot floppy")
     if not names:
         raise ValueError("boot floppy has no driver bundles")
     output = io.BytesIO()
@@ -988,6 +998,11 @@ def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = 
                 raise ValueError(f"{name}.config has no Default.table")
             instance = image.inspect(bundle + "/Instance0.table")[0]
             configuration = image.read(bundle + "/Instance0.table", instance)
+            # A package installs the original bundle from its BOM. Add only the
+            # configured instance; do not overwrite receipted files with the
+            # boot floppy's copy or promote its instance to Default.table.
+            if name in packaged:
+                entries = [replace(instance, name="Instance0.table")]
             for entry in entries:
                 # The installed loader must use the same variant as the boot floppy.
                 # In particular, EIDE's generic Default.table is not its PIIX table.
@@ -1008,7 +1023,8 @@ def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = 
 
 def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: PathInput, *,
                                  nextufs_binary: PathInput | None = None,
-                                 fix_pic_bug: bool = False) -> None:
+                                 fix_pic_bug: bool = False, package_hook: bytes = b"",
+                                 packaged_drivers: Iterable[str] = ()) -> None:
     """Prepare a User UFS installer with floppy drivers and an optional PIC fix.
 
     Stage a legacy-compatible tar archive on the CD and patch rc.cdrom to unpack
@@ -1021,14 +1037,17 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     base-system copy; leave the CD's original /mach_kernel untouched.
     Also install /usr/bin/fix-pic-bug so Patch 4's kernel can be patched later.
     Otherwise, leave kernel installation entirely to the original installer.
+    Run package_hook before copying driver configurations. For packaged_drivers,
+    stage only Instance0.table; their complete bundles come from package_hook.
     """
     with new_output(output, source=user_ufs) as staged:
         image = Image(executable(nextufs_binary), staged)
         path = "/etc/rc.cdrom"
         entry = image.inspect(path)[0]
         _, system = system_table(Image(executable(nextufs_binary), boot))
-        script = _patch_cd_installer(image.read(path, entry), driver_lists(system)[0], fix_pic_bug=fix_pic_bug)
-        archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary)
+        script = _patch_cd_installer(image.read(path, entry), driver_lists(system)[0],
+                                     fix_pic_bug=fix_pic_bug, package_hook=package_hook)
+        archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers)
         for payload in (_INSTALL_DRIVER_ARCHIVE, _INSTALL_KERNEL, _INSTALL_PIC_SCRIPT):
             if image.child("/NextCD", payload.rsplit("/", 1)[1]) is not None:
                 raise ValueError(f"User filesystem already contains {payload}")
@@ -1585,7 +1604,8 @@ def check_payload(iso: PathInput, lba: int, source: PathInput) -> None:
 
 def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                    ufs: PathInput, iso: PathInput, *, nextufs_binary: PathInput | None = None,
-                   installation_drivers: bool = False, fix_pic_bug: bool = False) -> None:
+                   installation_drivers: bool = False, fix_pic_bug: bool = False,
+                   package_hook: bytes = b"", packaged_drivers: Iterable[str] = ()) -> None:
     """Check bootloader, El Torito payloads, User UFS, and installer access.
 
     Read-only verification, including fsck of the prepared floppy; this does not
@@ -1610,9 +1630,10 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     original_script = nextufs("browse", "--raw", user_cd, "/etc/rc.cdrom", binary=nextufs_binary)
     if installation_drivers:
         _, system = system_table(Image(executable(nextufs_binary), boot))
-        expected_script = _patch_cd_installer(original_script, driver_lists(system)[0], fix_pic_bug=fix_pic_bug)
+        expected_script = _patch_cd_installer(original_script, driver_lists(system)[0],
+                                              fix_pic_bug=fix_pic_bug, package_hook=package_hook)
         archive = nextufs("browse", "--raw", iso, _INSTALL_DRIVER_ARCHIVE, binary=nextufs_binary)
-        if archive != _boot_driver_archive(boot, nextufs_binary=nextufs_binary):
+        if archive != _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers):
             raise ValueError("installation drivers differ from the boot floppy")
         original_kernel = nextufs("browse", "--raw", user_cd, "/mach_kernel", binary=nextufs_binary)
         if nextufs("browse", "--raw", iso, "/mach_kernel", binary=nextufs_binary) != original_kernel:
