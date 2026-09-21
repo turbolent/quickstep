@@ -42,6 +42,9 @@ python3 build_cd.py \
 - `--developer-patch /path/to/OS42MachDevPatch4.tar`: include Developer Patch 4.
 - `--profile-libs-patch /path/to/OS42MachPLibPatch4.tar`: include Profiling Libraries Patch 4.
 - `--setup-app /path/to/Setup.app`: include the native post-installation package selector (see [building Setup.app](setup/README.md)).
+- `--optional-driver-package /path/to/Driver.pkg`: copy an optional driver package to `/NextCD/Packages` and list it under **Drivers** when Setup.app is included.
+  Repeat the flag for additional packages; single-package tar archives are also accepted.
+  These choices are unchecked by default and do not change the boot-floppy drivers.
 - `--remove-language-packages`: remove additional language packages and their receipt entries from the generated CD.
   English and existing localized files in the base system are retained.
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.

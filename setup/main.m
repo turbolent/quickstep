@@ -58,18 +58,27 @@ static NSString *infoPath(NSString *bundle, NSString *name)
     return path;
 }
 
-static NSString *infoVersion(NSString *contents)
+static NSString *infoField(NSString *contents, const char *key)
 {
     NSEnumerator *lines = [[contents componentsSeparatedByString:@"\n"] objectEnumerator];
     NSString *line;
     NSString *result = nil;
+    size_t length = strlen(key);
     while ((line = [lines nextObject])) {
         const char *value = [line cString];
         while (*value && isspace((unsigned char)*value)) ++value;
-        if (!strncmp(value, "Version", 7) && isspace((unsigned char)value[7]))
-            result = trim(text(value + 7));
+        if (!strncasecmp(value, key, length) && isspace((unsigned char)value[length]))
+            result = trim(text(value + length));
     }
     return [result length] ? result : nil;
+}
+
+static BOOL receiptLocationMatches(NSDictionary *package, NSString *info, NSString *location)
+{
+    NSString *expected = infoField(info, "DefaultLocation");
+    if (!expected) expected = @"/";
+    return [location hasPrefix:@"/"] &&
+        ([[package objectForKey:@"Relocatable"] isEqual:@"YES"] || [location isEqualToString:expected]);
 }
 
 /* Identity plus content prevents an old 'installed' status being mistaken for
@@ -177,10 +186,10 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     NSDictionary *package = [model package:name];
     NSDictionary *stamp = receiptStamp([self receipt:name], name);
     NSString *location = stampText(stamp, @"location");
-    NSString *version = infoVersion(stampText(stamp, @"info"));
+    NSString *info = stampText(stamp, @"info");
+    NSString *version = infoField(info, "Version");
     if (!stamp || ![stampText(stamp, @"status") isEqualToString:@"installed"] ||
-        ![location hasPrefix:@"/"] ||
-        (![[package objectForKey:@"Relocatable"] isEqual:@"YES"] && ![location isEqualToString:@"/"]) ||
+        !receiptLocationMatches(package, info, location) ||
         ![version isEqualToString:[package objectForKey:@"Version"]]) return nil;
     return stamp;
 }
@@ -238,7 +247,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         NSString *path = [packageRoot stringByAppendingPathComponent:
                           [name stringByAppendingString:@".pkg"]];
         if ([files fileExistsAtPath:path isDirectory:&directory] && directory &&
-            [infoVersion([NSString stringWithContentsOfFile:infoPath(path, name)])
+            [infoField([NSString stringWithContentsOfFile:infoPath(path, name)], "Version")
                 isEqualToString:[package objectForKey:@"Version"]]) [available addObject:name];
     }
     [self scanInstalled];

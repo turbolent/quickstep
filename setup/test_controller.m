@@ -54,6 +54,20 @@ static void testFocusHandoff(void)
     }
 }
 
+static void testReceiptLocations(void)
+{
+    NSDictionary *fixed = [NSDictionary dictionaryWithObject:@"NO" forKey:@"Relocatable"];
+    NSDictionary *relocatable = [NSDictionary dictionaryWithObject:@"YES" forKey:@"Relocatable"];
+    NSString *info = @"Version 1\nDefaultLocation /private/Devices\n";
+    assert(receiptLocationMatches(fixed, info, @"/private/Devices"));
+    assert(!receiptLocationMatches(fixed, info, @"/"));
+    assert(!receiptLocationMatches(fixed, info, @"private/Devices"));
+    assert(receiptLocationMatches(relocatable, info, @"/elsewhere"));
+    assert(!receiptLocationMatches(relocatable, info, @"relative"));
+    assert(receiptLocationMatches(fixed, @"Version 1\n", @"/"));
+    assert([infoField(@"version 2\r\ndefaultlocation /private/Devices\r\n", "Version") isEqual:@"2"]);
+}
+
 /* The child checks argument boundaries and reports its inherited credentials.
  * It never opens a GUI or package, and exits when its input pipe closes. */
 static NSTask *startStub(void)
@@ -153,6 +167,7 @@ int main(int argc, char **argv)
     }
     pool = [[NSAutoreleasePool alloc] init];
     testFocusHandoff();
+    testReceiptLocations();
     stub = startStub(); unrelated = startStub();
     controller = [[TestController alloc] initWithTask:stub];
     [controller poll:nil]; assert([controller isBusy]);

@@ -120,7 +120,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           fix_pic_bug: bool = False, developer_cd: PathInput | None = None,
           user_patch: PathInput | None = None, developer_patch: PathInput | None = None,
           remove_language_packages: bool = False, setup_app: PathInput | None = None,
-          profile_libs_patch: PathInput | None = None) -> None:
+          profile_libs_patch: PathInput | None = None,
+          driver_packages: Sequence[PathInput] = ()) -> None:
     """Build and check the complete ISO; keep intermediates only until publication."""
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
@@ -151,6 +152,20 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                     not any(entry.name == package and entry.is_dir for entry in entries)):
                 raise ValueError(f"patch archive must contain only the directory {package}: {archive}")
     with media.new_output(output) as iso:
+        catalog = SETUP_CATALOG
+        driver_archives: list[Path] = []
+        for index, path in enumerate(driver_packages):
+            print(f"Checking driver package {path}...", flush=True)
+            archive = iso.parent / f"driver-package-{index}.tar"
+            info = pkg.prepare_package(path, archive)
+            if any(package.name == info.name for package in catalog.packages):
+                raise ValueError(f"duplicate Setup package name: {info.name}")
+            catalog = media.SetupCatalog(
+                catalog.packages + (media.SetupPackage(info.name, info.version, relocatable=info.relocatable,
+                                                       restart_required=True),),
+                catalog.choices + (media.SetupChoice("Drivers", info.title, (info.name,)),))
+            driver_archives.append(archive)
+        media.setup_plist(catalog, fix_pic_bug=fix_pic_bug)
         boot = iso.parent / "boot.img"
         ufs = iso.parent / "user.ufs"
         installer = iso.parent / "installer.ufs"
@@ -212,10 +227,16 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                 media.copy_tar(archive, installer, "/NextCD/Packages", patched_ufs,
                                nextufs_binary=nextufs_binary)
                 installer = patched_ufs
+        for index, archive in enumerate(driver_archives):
+            print(f"Adding driver package {driver_packages[index]} for manual installation...", flush=True)
+            with_driver = iso.parent / f"driver-package-{index}.ufs"
+            media.copy_tar(archive, installer, "/NextCD/Packages", with_driver,
+                           nextufs_binary=nextufs_binary)
+            installer = with_driver
         if setup_app is not None:
             print("Adding Setup.app for post-installation package setup...", flush=True)
             with_setup = iso.parent / "setup.ufs"
-            media.prepare_setup_app(setup_app, installer, with_setup, catalog=SETUP_CATALOG, fix_pic_bug=fix_pic_bug,
+            media.prepare_setup_app(setup_app, installer, with_setup, catalog=catalog, fix_pic_bug=fix_pic_bug,
                                     nextufs_binary=nextufs_binary)
             installer = with_setup
         print(f"Building ISO: {output}...", flush=True)
@@ -231,8 +252,10 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         for archive, _ in patches:
             if archive is not None:
                 media.verify_tar_copy(archive, iso, "/NextCD/Packages", nextufs_binary=nextufs_binary)
+        for archive in driver_archives:
+            media.verify_tar_copy(archive, iso, "/NextCD/Packages", nextufs_binary=nextufs_binary)
         if setup_app is not None:
-            media.verify_setup_app(setup_app, iso, catalog=SETUP_CATALOG, fix_pic_bug=fix_pic_bug,
+            media.verify_setup_app(setup_app, iso, catalog=catalog, fix_pic_bug=fix_pic_bug,
                                    nextufs_binary=nextufs_binary)
     print(f"Created bootable ISO: {output}")
 
@@ -256,6 +279,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="OS42MachPLibPatch4.tar to include for manual installation")
     parser.add_argument("--setup-app", type=Path, metavar="Setup.app",
                         help="native Setup.app release bundle to include for post-installation package setup")
+    parser.add_argument("--optional-driver-package", type=Path, action="append", default=[], metavar="PACKAGE",
+                        help=".pkg directory or single-package tar to include in Setup (repeatable)")
     parser.add_argument("--fix-pic-bug", action="store_true",
                         help="apply the PIC interrupt fix to the boot and installed kernels")
     parser.add_argument("--remove-language-packages", action="store_true",
@@ -273,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               bus_master_ide=args.bus_master_ide, fix_pic_bug=args.fix_pic_bug, developer_cd=args.developer_cd,
               user_patch=args.user_patch, developer_patch=args.developer_patch,
               remove_language_packages=args.remove_language_packages, setup_app=args.setup_app,
-              profile_libs_patch=args.profile_libs_patch)
+              profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"build_cd.py: {exc}\n")
     return 0

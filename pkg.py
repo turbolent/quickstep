@@ -19,7 +19,15 @@ import bom
 import media
 
 
-__all__ = ["InstalledPackage", "install_package", "installation_hook"]
+__all__ = ["PackageInfo", "prepare_package", "InstalledPackage", "install_package", "installation_hook"]
+
+
+@dataclass(frozen=True)
+class PackageInfo:
+    name: str
+    title: str
+    version: str
+    relocatable: bool
 
 
 @dataclass(frozen=True)
@@ -192,11 +200,14 @@ def _package_bundle(path: media.PathInput) -> tuple[str, dict[str, _PackageFile]
     """Read a .pkg directory or a tar containing exactly one .pkg directory."""
     path = Path(path)
     files: dict[str, _PackageFile] = {}
-    if stat.S_ISDIR(media.local_stat(path).st_mode):
+    mode = media.local_stat(path).st_mode
+    if stat.S_ISDIR(mode):
         name = path.name
         for entry in media.local_tree(path):
             files[entry.name] = _PackageFile(entry, b"" if entry.is_dir else (path / entry.name).read_bytes())
     else:
+        if not stat.S_ISREG(mode):
+            raise ValueError(f"package archive must be a regular file: {path}")
         data = path.read_bytes()
         if data.startswith(b"\x1f\x9d"):
             data = _uncompress(data)
@@ -216,8 +227,6 @@ def _package_bundle(path: media.PathInput) -> tuple[str, dict[str, _PackageFile]
     media.component(name)
     for relative in files:
         _package_path(relative)
-        if relative.endswith((".pre_install", ".post_install")):
-            raise ValueError(f"offline installation rejects install scripts: {name}/{relative}")
     return name[:-4], files
 
 
@@ -236,6 +245,53 @@ def _package_fields(data: bytes, *, numeric: bool = False) -> dict[str, str]:
             value = re.split(r"[ \t\r\v\f]+", value, maxsplit=1)[0]
         result[fields[0].lower()] = value
     return result
+
+
+def prepare_package(package: media.PathInput, output: media.PathInput) -> PackageInfo:
+    """Stage a .pkg directory or single-package tar for copying onto a CD.
+
+    Preserve the bundle, including scripts and its compressed payload, without
+    installing it or executing anything. Return metadata for a Setup catalog.
+    """
+    name, files = _package_bundle(package)
+
+    def resource(extension: str, *, localized: bool = False) -> _PackageFile:
+        leaf = name + "." + extension
+        for path in (["English.lproj/" + leaf] if localized else []) + [leaf]:
+            item = files.get(path)
+            if item is not None and stat.S_ISREG(item.entry.mode):
+                return item
+        raise ValueError(f"missing package resource: {name}.pkg/{leaf}")
+
+    fields = _package_fields(resource("info", localized=True).data)
+    for field in ("title", "version", "description", "defaultlocation", "diskname"):
+        if not fields.get(field, "").strip():
+            raise ValueError(f"missing package info field {field}: {name}.pkg")
+    relocatable = fields.get("relocatable", "NO").strip().upper()
+    if relocatable not in ("YES", "NO"):
+        raise ValueError(f"invalid package Relocatable value: {name}.pkg")
+    location = fields["defaultlocation"].strip()
+    if not location.startswith("/") and relocatable != "YES":
+        raise ValueError(f"non-relocatable package requires an absolute DefaultLocation: {name}.pkg")
+    resource("sizes", localized=True)
+    resource("bom")
+    resource("tar.Z")
+    info = PackageInfo(name, fields["title"].strip(), fields["version"].strip(), relocatable == "YES")
+    # Validate strings before staging; Setup's generated plist is ASCII.
+    media.setup_plist(media.SetupCatalog(
+        (media.SetupPackage(info.name, info.version, relocatable=info.relocatable),),
+        (media.SetupChoice("Drivers", info.title, (info.name,)),)))
+    with media.new_output(output) as staged:
+        with tarfile.open(staged, "w") as archive:
+            for relative, item in files.items():
+                entry = item.entry
+                path = name + ".pkg" + ("/" + relative if relative != "." else "")
+                member = tarfile.TarInfo(path)
+                member.type = tarfile.DIRTYPE if entry.is_dir else tarfile.REGTYPE
+                member.mode, member.uid, member.gid = stat.S_IMODE(entry.mode), entry.uid, entry.gid
+                member.mtime, member.size = entry.mtime, len(item.data)
+                archive.addfile(member, None if entry.is_dir else io.BytesIO(item.data))
+    return info
 
 
 def _package_checksum(data: bytes) -> int:
@@ -336,6 +392,9 @@ def install_package(package: media.PathInput, target_ufs: media.PathInput, outpu
     Return the installed package's identity, location and payload paths.
     """
     name, files = _package_bundle(package)
+    for relative in files:
+        if relative.endswith((".pre_install", ".post_install")):
+            raise ValueError(f"offline installation rejects install scripts: {name}.pkg/{relative}")
     language_dirs = [media.component(language) + ".lproj" for language in languages]
 
     def resource(extension: str, *, localized: bool = False) -> _PackageFile:
