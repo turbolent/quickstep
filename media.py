@@ -1115,6 +1115,20 @@ def _directory(image: Image, path: str) -> Entry:
     return entry
 
 
+def _blank_builddisk_nib(nib: bytes) -> bytes:
+    """Blank the prototype title without changing typedstream lengths/references."""
+    title = b"<do not localize>"
+    prefix = b"\x84\x84" + bytes((len(title),))
+    original, blank = prefix + title, prefix + b" " * len(title)
+    if not nib.startswith(b"\x04\x0btypedstream"):
+        raise ValueError("expected a BuildDisk typedstream NIB")
+    if nib.count(original) == 1:
+        return nib.replace(original, blank, 1)
+    if original not in nib and nib.count(blank) == 1:
+        return nib  # Already blanked.
+    raise ValueError("expected one BuildDisk NIB prototype title")
+
+
 def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
                              nextufs_binary: PathInput | None = None) -> None:
     """Copy a User UFS without the five optional non-English Essentials packages.
@@ -1123,6 +1137,7 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
     uses as its package inventory. English is part of BaseSystem, not a separate
     package. Leave localized files in the base filesystem and all other packages
     alone. Missing packages are allowed, so an already-pruned image is valid.
+    Blank BuildDisk's unused language-heading prototype text in its English NIB.
     """
     packages = {language + "Essentials.pkg" for language in
                 ("French", "German", "Italian", "Spanish", "Swedish")}
@@ -1140,8 +1155,28 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
                 path = parent + "/" + entry.name
                 _directory(source, path)
                 trees.append((path, source.tree(path)))
+    application = "/NextAdmin/BuildDisk.app"
+    builddisk = None
+    if source.child("/", "NextAdmin") is not None:
+        _directory(source, "/NextAdmin")
+        if source.child("/NextAdmin", "BuildDisk.app") is not None:
+            nib_directory = application + "/English.lproj/Install.nib"
+            nib_metadata = _directory(source, nib_directory)
+            path = nib_directory + "/data.nib"
+            entry = source.inspect(path)[0]
+            original = source.read(path, entry)
+            patched = _blank_builddisk_nib(original)
+            builddisk = (path, entry, patched, original != patched)
     with new_output(output, source=user_ufs) as staged:
         target = Image(binary, staged)
+        if builddisk is not None:
+            path, entry, patched, changed = builddisk
+            if changed:
+                print("Blanking BuildDisk's unused language-heading text...", flush=True)
+                target.write(path, patched, entry, exists=True)
+                target.metadata(nib_directory, nib_metadata)
+            if target.read(path) != patched:
+                raise ValueError("BuildDisk NIB readback failed")
         for root, entries in trees:
             print(f"Removing {root}...", flush=True)
             for entry in reversed(entries):
