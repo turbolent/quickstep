@@ -7,6 +7,7 @@ See build_cd.py for an example bootable-CD recipe using this library.
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import io
 import json
 import os
@@ -30,7 +31,7 @@ __all__ = [
     "check_image", "pad_image", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
     "prepare_installation_drivers", "verify_boot_cd",
     "skip_boot_language_selection",
-    "remove_language_packages",
+    "remove_language_packages", "patch_builddisk_language_heading",
     "copy_directory", "verify_directory_copy",
     "copy_tar", "verify_tar_copy", "tar_entries",
     "MAX_GROWN_FLOPPY_KIB", "MAX_BOOT_FLOPPY_KIB",
@@ -1115,18 +1116,39 @@ def _directory(image: Image, path: str) -> Entry:
     return entry
 
 
-def _blank_builddisk_nib(nib: bytes) -> bytes:
-    """Blank the prototype title without changing typedstream lengths/references."""
-    title = b"<do not localize>"
-    prefix = b"\x84\x84" + bytes((len(title),))
-    original, blank = prefix + title, prefix + b" " * len(title)
-    if not nib.startswith(b"\x04\x0btypedstream"):
-        raise ValueError("expected a BuildDisk typedstream NIB")
-    if nib.count(original) == 1:
-        return nib.replace(original, blank, 1)
-    if original not in nib and nib.count(blank) == 1:
-        return nib  # Already blanked.
-    raise ValueError("expected one BuildDisk NIB prototype title")
+_BUILDDISK_LANGUAGE_ROW = bytes.fromhex(
+    "6a008b95dcfdffff52428995dcfdffff8b0db0c91600518b15acc91600528b4d088b492051"
+    "e82eb0ff0483c40850e825b0ff0489c683c424"
+    "8b550883bab0000000000f84b50000008b82b0000000807819000f84a5000000")
+_BUILDDISK_LANGUAGE_ROW_FIXED = bytes.fromhex(
+    "83c4148b55088b82b000000085c00f84e9000000807819000f84df0000009090"
+    "6a008b95dcfdffff52428995dcfdffff8b0db0c91600518b15acc91600528b4d088b492051"
+    "e80eb0ff0483c40850e805b0ff0489c683c410")
+_BUILDDISK_PROFILES = (
+    # Stock OPENSTEP 4.2 three-architecture executable and its Intel slice.
+    (0x3c41f, "78bc4589785421a0b0e0b6a5281458c8e10125a0a3bb67fe8478e4c0b51f2fa5"),
+    (0x641f, "f6274672318d3d0acae7dd5489242516d7529ea37261428a0e5f8641892cc8ff"),
+)
+
+
+def patch_builddisk_language_heading(binary: bytes) -> bytes:
+    """Create BuildDisk's Languages heading only when language packages exist.
+
+    At i386 VA 0x841f, move the package/language guard before addRow. Adjust
+    both conditional branches and objc_msgSend calls, retaining the 20-byte
+    stack cleanup owed by the preceding Essentials row on either exit.
+    The unused row otherwise keeps its prototype tag as well as its title;
+    merely blanking the NIB title leaves an unsafe selectable cell.
+    Accept only known stock 4.2 executables or this exact patch.
+    """
+    size = len(_BUILDDISK_LANGUAGE_ROW)
+    for offset, checksum in _BUILDDISK_PROFILES:
+        if binary[offset:offset + size] not in (_BUILDDISK_LANGUAGE_ROW, _BUILDDISK_LANGUAGE_ROW_FIXED):
+            continue
+        original = binary[:offset] + _BUILDDISK_LANGUAGE_ROW + binary[offset + size:]
+        if hashlib.sha256(original).hexdigest() == checksum:
+            return binary[:offset] + _BUILDDISK_LANGUAGE_ROW_FIXED + binary[offset + size:]
+    raise ValueError("unsupported BuildDisk executable for the language-heading fix (expected OPENSTEP 4.2)")
 
 
 def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
@@ -1137,7 +1159,7 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
     uses as its package inventory. English is part of BaseSystem, not a separate
     package. Leave localized files in the base filesystem and all other packages
     alone. Missing packages are allowed, so an already-pruned image is valid.
-    Blank BuildDisk's unused language-heading prototype text in its English NIB.
+    Omit the unused Languages heading in the stock Intel BuildDisk, if present.
     """
     packages = {language + "Essentials.pkg" for language in
                 ("French", "German", "Italian", "Spanish", "Swedish")}
@@ -1160,23 +1182,22 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
     if source.child("/", "NextAdmin") is not None:
         _directory(source, "/NextAdmin")
         if source.child("/NextAdmin", "BuildDisk.app") is not None:
-            nib_directory = application + "/English.lproj/Install.nib"
-            nib_metadata = _directory(source, nib_directory)
-            path = nib_directory + "/data.nib"
+            app_metadata = _directory(source, application)
+            path = application + "/BuildDisk"
             entry = source.inspect(path)[0]
             original = source.read(path, entry)
-            patched = _blank_builddisk_nib(original)
+            patched = patch_builddisk_language_heading(original)
             builddisk = (path, entry, patched, original != patched)
     with new_output(output, source=user_ufs) as staged:
         target = Image(binary, staged)
         if builddisk is not None:
             path, entry, patched, changed = builddisk
             if changed:
-                print("Blanking BuildDisk's unused language-heading text...", flush=True)
+                print("Removing BuildDisk's unused language heading...", flush=True)
                 target.write(path, patched, entry, exists=True)
-                target.metadata(nib_directory, nib_metadata)
+                target.metadata(application, app_metadata)
             if target.read(path) != patched:
-                raise ValueError("BuildDisk NIB readback failed")
+                raise ValueError("BuildDisk language-heading fix readback failed")
         for root, entries in trees:
             print(f"Removing {root}...", flush=True)
             for entry in reversed(entries):
