@@ -121,7 +121,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           user_patch: PathInput | None = None, developer_patch: PathInput | None = None,
           remove_language_packages: bool = False, setup_app: PathInput | None = None,
           profile_libs_patch: PathInput | None = None,
-          driver_packages: Sequence[PathInput] = ()) -> None:
+          driver_packages: Sequence[PathInput] = (), framebuffer_wc: PathInput | None = None) -> None:
     """Build and check the complete ISO; keep intermediates only until publication."""
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
@@ -139,6 +139,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
     if setup_app is not None:
         media.validate_setup_app(setup_app)
         media.setup_plist(SETUP_CATALOG, fix_pic_bug=fix_pic_bug)
+        if framebuffer_wc is not None and not (Path(setup_app) / "setup-framebuffer-wc.sh").is_file():
+            raise ValueError("--framebuffer-wc requires a rebuilt Setup.app containing setup-framebuffer-wc.sh")
     nextufs_binary = media.executable(nextufs_binary)
     iso_tool = media.resolve_iso_tool(iso_tool, nextufs_binary=nextufs_binary)
     patches = ((user_patch, "OS42MachUserPatch4.pkg"),
@@ -154,15 +156,23 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
     with media.new_output(output) as iso:
         catalog = SETUP_CATALOG
         driver_archives: list[Path] = []
-        for index, path in enumerate(driver_packages):
+        optional_drivers = [(path, False) for path in driver_packages]
+        if framebuffer_wc is not None:
+            optional_drivers.append((framebuffer_wc, True))
+        for index, (path, framebuffer) in enumerate(optional_drivers):
             print(f"Checking driver package {path}...", flush=True)
             archive = iso.parent / f"driver-package-{index}.tar"
             info = pkg.prepare_package(path, archive)
+            if framebuffer and (info.name != "FramebufferWC" or info.relocatable):
+                raise ValueError("--framebuffer-wc requires the non-relocatable FramebufferWC package")
             if any(package.name == info.name for package in catalog.packages):
                 raise ValueError(f"duplicate Setup package name: {info.name}")
             catalog = media.SetupCatalog(
-                catalog.packages + (media.SetupPackage(info.name, info.version, relocatable=info.relocatable,
-                                                       restart_required=True),),
+                catalog.packages + (media.SetupPackage(
+                    info.name, info.version, dependencies=("OS42MachUserPatch4",) if framebuffer else (),
+                    relocatable=info.relocatable, restart_required=True,
+                    post_install=("/bin/sh", "Setup.app/setup-framebuffer-wc.sh")
+                    if framebuffer else ()),),
                 catalog.choices + (media.SetupChoice("Drivers", info.title, (info.name,)),))
             driver_archives.append(archive)
         media.setup_plist(catalog, fix_pic_bug=fix_pic_bug)
@@ -228,7 +238,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                                nextufs_binary=nextufs_binary)
                 installer = patched_ufs
         for index, archive in enumerate(driver_archives):
-            print(f"Adding driver package {driver_packages[index]} for manual installation...", flush=True)
+            print(f"Adding driver package {optional_drivers[index][0]} for manual installation...", flush=True)
             with_driver = iso.parent / f"driver-package-{index}.ufs"
             media.copy_tar(archive, installer, "/NextCD/Packages", with_driver,
                            nextufs_binary=nextufs_binary)
@@ -281,6 +291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="native Setup.app release bundle to include for post-installation package setup")
     parser.add_argument("--optional-driver-package", type=Path, action="append", default=[], metavar="PACKAGE",
                         help=".pkg directory or single-package tar to include in Setup (repeatable)")
+    parser.add_argument("--framebuffer-wc", type=Path, metavar="PACKAGE",
+                        help="FramebufferWC package to include in Setup; requires User Patch 4 and patches VBE after installation")
     parser.add_argument("--fix-pic-bug", action="store_true",
                         help="apply the PIC interrupt fix to the boot and installed kernels")
     parser.add_argument("--remove-language-packages", action="store_true",
@@ -298,7 +310,8 @@ def main(argv: Sequence[str] | None = None) -> int:
               bus_master_ide=args.bus_master_ide, fix_pic_bug=args.fix_pic_bug, developer_cd=args.developer_cd,
               user_patch=args.user_patch, developer_patch=args.developer_patch,
               remove_language_packages=args.remove_language_packages, setup_app=args.setup_app,
-              profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package)
+              profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package,
+              framebuffer_wc=args.framebuffer_wc)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"build_cd.py: {exc}\n")
     return 0

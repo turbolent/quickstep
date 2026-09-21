@@ -58,6 +58,16 @@ int main(int argc, char **argv)
     assert([model choiceVisible:[[model choices] objectAtIndex:1]
                      available:[NSSet setWithObject:@"Tools"] installed:[NSSet setWithObject:@"Libs"]]);
     invalid(nil); invalid(@"not a dictionary");
+    /* A post-install action is an argv array, never an implicit shell command. */
+    for (i = 0; i < 3; ++i) {
+        changed = [[plist mutableCopy] autorelease];
+        package = [[[packages objectAtIndex:0] mutableCopy] autorelease];
+        [package setObject:i == 0 ? (id)@"/bin/true" : i == 1 ?
+            (id)[NSArray arrayWithObject:@"relative"] : (id)[NSArray arrayWithObjects:@"/bin/sh", @"", nil]
+                    forKey:@"PostInstall"];
+        many = [[packages mutableCopy] autorelease]; [many replaceObjectAtIndex:0 withObject:package];
+        [changed setObject:many forKey:@"Packages"]; invalid(changed);
+    }
     changed = [[plist mutableCopy] autorelease];
     [changed setObject:@"2" forKey:@"FormatVersion"]; invalid(changed);
     [changed setObject:@"1" forKey:@"FormatVersion"];
@@ -91,7 +101,17 @@ int main(int argc, char **argv)
     if (argc == 2) {
         plist = [NSDictionary dictionaryWithContentsOfFile:[NSString stringWithCString:argv[1]]];
         model = [[SetupModel alloc] initWithPropertyList:plist error:&error];
-        assert(model && !error); [model release];
+        assert(model && !error);
+        if ([model package:@"FramebufferWC"]) {
+            NSSet *available = [NSSet setWithObjects:@"OS42MachUserPatch4", @"FramebufferWC", nil];
+            queue = [model plan:[NSSet setWithObject:@"FramebufferWC"] available:available
+                       installed:[NSSet set] missing:missing];
+            assert(([queue isEqual:[NSArray arrayWithObjects:@"OS42MachUserPatch4", @"FramebufferWC", nil]]));
+            [model plan:[NSSet setWithObject:@"FramebufferWC"] available:[NSSet setWithObject:@"FramebufferWC"]
+              installed:[NSSet set] missing:missing];
+            assert([missing isEqual:[NSSet setWithObject:@"OS42MachUserPatch4"]]);
+        }
+        [model release];
     }
     puts("Setup catalog tests passed.");
     [pool release];

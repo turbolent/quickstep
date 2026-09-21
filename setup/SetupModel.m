@@ -20,6 +20,16 @@ static BOOL packageName(id name)
     return strspn(bytes, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.+-") == strlen(bytes);
 }
 
+static BOOL command(id value)
+{
+    unsigned i;
+    if (!value) return YES;  /* Older catalogs have no post-install actions. */
+    if (![value isKindOfClass:[NSArray class]]) return NO;
+    for (i = 0; i < [value count]; ++i)
+        if (!string([value objectAtIndex:i])) return NO;
+    return ![value count] || [[value objectAtIndex:0] hasPrefix:@"/"];
+}
+
 static BOOL references(id names, NSDictionary *packages)
 {
     unsigned i;
@@ -54,7 +64,7 @@ static BOOL references(id names, NSDictionary *packages)
         name = [package objectForKey:@"Name"];
         if (!packageName(name) || [index objectForKey:name] || !string([package objectForKey:@"Version"]) ||
             !flag([package objectForKey:@"Relocatable"]) || !flag([package objectForKey:@"RestartRequired"]) ||
-            !flag([package objectForKey:@"FixPICAfter"])) goto invalid;
+            !flag([package objectForKey:@"FixPICAfter"]) || !command([package objectForKey:@"PostInstall"])) goto invalid;
         [index setObject:package forKey:name];
     }
     problem = @"Unknown or invalid dependency in Setup.plist.";

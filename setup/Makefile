@@ -3,7 +3,12 @@ CC = cc
 CFLAGS = -arch i386 -O -Wall
 APP = build/Setup.app
 
-all: $(APP)/Setup
+all: $(APP)/Setup $(APP)/setup-framebuffer-wc.sh
+
+$(APP)/setup-framebuffer-wc.sh: setup-framebuffer-wc.sh
+	/bin/mkdirs $(APP)
+	/bin/cp setup-framebuffer-wc.sh $@
+	/bin/rm -f $(APP)/setup-framebuffer-wc.pl
 
 $(APP)/Setup: main.m SetupModel.m SetupModel.h
 	/bin/mkdirs $(APP)

@@ -68,6 +68,107 @@ static void testReceiptLocations(void)
     assert([infoField(@"version 2\r\ndefaultlocation /private/Devices\r\n", "Version") isEqual:@"2"]);
 }
 
+static void testPackageDescriptions(void)
+{
+    NSString *root = [NSString stringWithFormat:@"./build/description-test-%ld", (long)getpid()];
+    NSString *cd = [root stringByAppendingPathComponent:@"CD"];
+    NSString *receipts = [root stringByAppendingPathComponent:@"Receipts"];
+    NSArray *directories = [NSArray arrayWithObjects:@"CD", @"CD/Tools.pkg", @"CD/Tools.pkg/English.lproj",
+        @"Receipts", @"Receipts/Tools.pkg", @"Receipts/Libs.pkg", nil];
+    NSArray *files = [NSArray arrayWithObjects:@"CD/Tools.pkg/Tools.info", @"CD/Tools.pkg/English.lproj/Tools.info",
+        @"Receipts/Tools.pkg/Tools.info", @"Receipts/Libs.pkg/Libs.info", nil];
+    NSArray *contents = [NSArray arrayWithObjects:@"Title Tools\nDescription Root description\n",
+        @"Title Developer Tools\r\nDescription   Compilers and debuggers.  \r\n",
+        @"Title Old tools\nDescription Older receipt description\n",
+        @"description Development libraries.\n", nil];
+    NSDictionary *single = [NSDictionary dictionaryWithObject:[NSArray arrayWithObject:@"Tools"] forKey:@"Packages"];
+    NSDictionary *group = [NSDictionary dictionaryWithObject:
+        [NSArray arrayWithObjects:@"Tools", @"Libs", @"Missing", nil] forKey:@"Packages"];
+    NSDictionary *missing = [NSDictionary dictionaryWithObject:[NSArray arrayWithObject:@"Missing"] forKey:@"Packages"];
+    int i;
+    assert([NSView instancesRespondToSelector:@selector(setToolTip:)]);
+    assert(mkdir([root cString], 0700) == 0);
+    for (i = 0; i < [directories count]; ++i)
+        assert(mkdir([[root stringByAppendingPathComponent:[directories objectAtIndex:i]] cString], 0700) == 0);
+    for (i = 0; i < [files count]; ++i)
+        assert([[contents objectAtIndex:i] writeToFile:[root stringByAppendingPathComponent:[files objectAtIndex:i]]
+                                           atomically:YES]);
+    assert([choiceDescription(single, cd, receipts) isEqual:@"Compilers and debuggers."]);
+    assert([choiceDescription(group, cd, receipts) isEqual:
+        @"Developer Tools: Compilers and debuggers.\n\nLibs: Development libraries."]);
+    assert(choiceDescription(missing, cd, receipts) == nil);
+    /* Prefer English metadata, then root metadata; missing descriptions may
+     * fall back to an installed receipt. Missing metadata is simply omitted. */
+    assert(unlink([[root stringByAppendingPathComponent:[files objectAtIndex:1]] cString]) == 0);
+    assert([choiceDescription(single, cd, receipts) isEqual:@"Root description"]);
+    assert([@"Title Tools\nDescription   \n" writeToFile:
+        [root stringByAppendingPathComponent:[files objectAtIndex:0]] atomically:YES]);
+    assert([choiceDescription(single, cd, receipts) isEqual:@"Older receipt description"]);
+    for (i = 0; i < [files count]; ++i)
+        if (i != 1) assert(unlink([[root stringByAppendingPathComponent:[files objectAtIndex:i]] cString]) == 0);
+    for (i = [directories count] - 1; i >= 0; --i)
+        assert(rmdir([[root stringByAppendingPathComponent:[directories objectAtIndex:i]] cString]) == 0);
+    assert(rmdir([root cString]) == 0);
+}
+
+static void testPackageListResizing(void)
+{
+    NSClipView *clip = [[NSClipView alloc] initWithFrame:NSMakeRect(0, 0, 410, 245)];
+    PackageListView *list = [[PackageListView alloc] initWithFrame:NSMakeRect(0, 0, 410, 245)];
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(14, 24, 396, 20)];
+    [list setAutoresizingMask:NSViewWidthSizable];
+    [row setAutoresizingMask:NSViewWidthSizable];
+    [list addSubview:row]; [clip setDocumentView:list];
+    [clip setFrameSize:NSMakeSize(610, 445)];
+    assert([list isFlipped] && NSWidth([list frame]) == 610);
+    assert(NSWidth([row frame]) == 596 && NSMinY([row frame]) == 24);
+    assert(NSMinY([clip bounds]) == 0);
+    /* Growing the viewport must not leave short lists at its bottom. */
+    [clip setFrameSize:NSMakeSize(350, 545)];
+    assert(NSWidth([list frame]) == 350 && NSWidth([row frame]) == 336);
+    assert(NSMinY([clip bounds]) == 0);
+    /* Long lists keep their row spacing and can still scroll after a resize. */
+    [list setFrameSize:NSMakeSize(350, 900)];
+    [clip setFrameSize:NSMakeSize(450, 145)];
+    [clip scrollToPoint:NSMakePoint(0, 500)];
+    assert(NSMinY([clip bounds]) == 500 && NSWidth([list frame]) == 450);
+    assert(NSMinY([row frame]) == 24 && NSHeight([row frame]) == 20);
+    [clip release]; [list release]; [row release];
+}
+
+@interface CloseProbe : SetupController
+{
+    BOOL terminated;
+    int alerts;
+}
+- (id)initWithBusy:(BOOL)flag;
+- (void)terminate:(id)sender;
+- (BOOL)terminated;
+- (int)alerts;
+@end
+
+@implementation CloseProbe
+- (id)initWithBusy:(BOOL)flag { self = [super init]; busy = flag; return self; }
+- (void)terminate:(id)sender { terminated = [self applicationShouldTerminate:nil]; }
+- (void)alert:(NSString *)message { ++alerts; }
+- (BOOL)terminated { return terminated; }
+- (int)alerts { return alerts; }
+@end
+
+static void testWindowClose(void)
+{
+    id savedApp = NSApp;
+    int flag;
+    for (flag = 0; flag < 2; ++flag) {
+        CloseProbe *probe = [[CloseProbe alloc] initWithBusy:flag];
+        NSApp = probe;
+        assert(![probe windowShouldClose:nil]);
+        assert([probe terminated] == !flag && [probe alerts] == flag);
+        NSApp = savedApp;
+        [probe release];
+    }
+}
+
 /* The child checks argument boundaries and reports its inherited credentials.
  * It never opens a GUI or package, and exits when its input pipe closes. */
 static NSTask *startStub(void)
@@ -152,6 +253,136 @@ static void finishStub(NSTask *task)
 }
 @end
 
+@interface ActionController : TestController
+{
+    int actions;
+}
+- (void)setCommand:(NSArray *)command;
+- (void)alreadyInstalled;
+- (void)waitForAction;
+- (int)actions;
+- (BOOL)actionComplete;
+- (void)missingPrerequisite;
+- (void)useTestLogAndDirectory;
+- (BOOL)logContains:(const char *)value;
+@end
+
+@implementation ActionController
+- (id)initWithTask:(NSTask *)task
+{
+    self = [super initWithTask:task];
+    [self keepOnlyCurrentPackage];
+    available = [[NSMutableSet alloc] initWithObjects:@"Tools", @"Patch", nil];
+    postInstallDone = [[NSMutableSet alloc] init];
+    [installed addObject:@"Tools"];
+    [self setCommand:[NSArray arrayWithObjects:@"/bin/sh", @"-c", @"exit 0", nil]];
+    return self;
+}
+- (void)setCommand:(NSArray *)command
+{
+    NSMutableDictionary *plist = [[[NSDictionary dictionaryWithContentsOfFile:@"test_catalog.plist"] mutableCopy] autorelease];
+    NSArray *packages = [plist objectForKey:@"Packages"];
+    NSMutableDictionary *package = [[[packages objectAtIndex:0] mutableCopy] autorelease];
+    NSString *error = nil;
+    [package setObject:[NSArray arrayWithObject:@"Tools"] forKey:@"Dependencies"];
+    [package setObject:command forKey:@"PostInstall"];
+    [plist setObject:@"NO" forKey:@"FixPICBug"];
+    [plist setObject:[NSArray arrayWithObjects:[packages objectAtIndex:2], package, nil] forKey:@"Packages"];
+    [plist setObject:[NSArray array] forKey:@"Choices"];
+    [model release]; model = [[SetupModel alloc] initWithPropertyList:plist error:&error];
+    assert(model && !error);
+}
+- (void)alreadyInstalled
+{
+    [installed addObject:@"Patch"];
+    [active release]; active = nil;
+}
+- (void)startPostInstall { ++actions; [super startPostInstall]; }
+- (void)waitForAction { assert(postInstallTask); [postInstallTask waitUntilExit]; }
+- (int)actions { return actions; }
+- (BOOL)actionComplete { return [[self completed] containsObject:@"Patch"]; }
+- (void)missingPrerequisite
+{
+    [installed removeObject:@"Tools"]; [available removeObject:@"Tools"];
+    busy = NO;
+}
+- (void)useTestLogAndDirectory
+{
+    cdRoot = [@"/private/tmp" retain];
+    log = tmpfile(); assert(log);
+}
+- (BOOL)logContains:(const char *)value
+{
+    char data[1024];
+    int count;
+    rewind(log); count = fread(data, 1, sizeof(data) - 1, log); data[count] = 0;
+    fseek(log, 0, SEEK_END);
+    return strstr(data, value) != NULL;
+}
+@end
+
+static void testPostInstall(void)
+{
+    NSTask *stub = startStub();
+    ActionController *controller = [[ActionController alloc] initWithTask:stub];
+    [controller publishReceipt]; [controller poll:nil]; [controller poll:nil];
+    assert([controller isBusy] && [controller actions] == 0 && ![controller actionComplete]);
+    finishStub(stub); [controller poll:nil];
+    assert([controller isBusy] && [controller actions] == 1 && [controller alerts] == 0);
+    [controller waitForAction]; [controller poll:nil];
+    assert(![controller isBusy] && [controller actionComplete] && [controller alerts] == 1);
+    [controller release]; [stub release];
+
+    /* Cancellation never runs an action just because a package was selected. */
+    stub = startStub(); controller = [[ActionController alloc] initWithTask:stub];
+    finishStub(stub); [controller poll:nil];
+    assert(![controller isBusy] && [controller actions] == 0);
+    [controller release]; [stub release];
+
+    /* Existing receipts still need the idempotent action; failure keeps Retry
+     * available without reinstalling the package or launching Installer. */
+    controller = [[ActionController alloc] initWithTask:nil];
+    [controller alreadyInstalled];
+    [controller setCommand:[NSArray arrayWithObjects:@"/bin/sh", @"-c", @"exit 7", nil]];
+    [controller advance]; [controller waitForAction]; [controller poll:nil];
+    assert(![controller isBusy] && ![controller actionComplete] && [controller actions] == 1);
+    [controller setCommand:[NSArray arrayWithObjects:@"/bin/sh", @"-c", @"exit 0", nil]];
+    [controller install:nil]; [controller waitForAction]; [controller poll:nil];
+    assert(![controller isBusy] && [controller actionComplete] && [controller actions] == 2);
+    [controller release];
+
+    controller = [[ActionController alloc] initWithTask:nil];
+    [controller alreadyInstalled];
+    [controller setCommand:[NSArray arrayWithObject:@"/nonexistent/Setup-test-helper"]];
+    [controller advance];
+    assert(![controller isBusy] && ![controller actionComplete] && [controller alerts] == 1);
+    [controller release];
+
+    controller = [[ActionController alloc] initWithTask:nil];
+    [controller alreadyInstalled]; [controller missingPrerequisite];
+    [controller install:nil];
+    assert(![controller isBusy] && [controller actions] == 0 && [controller alerts] == 1);
+    [controller release];
+
+    controller = [[ActionController alloc] initWithTask:nil];
+    [controller alreadyInstalled]; [controller useTestLogAndDirectory];
+    [controller setCommand:[NSArray arrayWithObjects:@"/bin/sh", @"-c", @"pwd; echo helper-stderr >&2", nil]];
+    [controller advance]; [controller waitForAction]; [controller poll:nil];
+    assert([controller actionComplete]);
+    assert([controller logContains:"/private/tmp"] && [controller logContains:"helper-stderr"]);
+    [controller release];
+
+    /* Stop waits for Installer exit and the installed package's action. */
+    stub = startStub(); controller = [[ActionController alloc] initWithTask:stub];
+    [controller publishReceipt]; [controller poll:nil]; [controller poll:nil];
+    [controller quit:nil]; assert([controller isBusy] && [controller actions] == 0);
+    finishStub(stub); [controller poll:nil];
+    assert([controller isBusy] && [controller actions] == 1);
+    [controller quit:nil]; [controller waitForAction]; [controller poll:nil];
+    assert(![controller isBusy] && [controller actionComplete]);
+    [controller release]; [stub release];
+}
+
 int main(int argc, char **argv)
 {
     NSAutoreleasePool *pool;
@@ -168,6 +399,10 @@ int main(int argc, char **argv)
     pool = [[NSAutoreleasePool alloc] init];
     testFocusHandoff();
     testReceiptLocations();
+    testPackageDescriptions();
+    testPackageListResizing();
+    testWindowClose();
+    testPostInstall();
     stub = startStub(); unrelated = startStub();
     controller = [[TestController alloc] initWithTask:stub];
     [controller poll:nil]; assert([controller isBusy]);

@@ -73,6 +73,33 @@ static NSString *infoField(NSString *contents, const char *key)
     return [result length] ? result : nil;
 }
 
+static NSString *choiceDescription(NSDictionary *choice, NSString *packageRoot, NSString *receiptRoot)
+{
+    NSArray *names = [choice objectForKey:@"Packages"];
+    NSMutableArray *parts = [NSMutableArray array];
+    NSEnumerator *packages = [names objectEnumerator];
+    NSString *name;
+    while ((name = [packages nextObject])) {
+        NSString *leaf = [name stringByAppendingString:@".pkg"];
+        NSString *info = [NSString stringWithContentsOfFile:
+            infoPath([packageRoot stringByAppendingPathComponent:leaf], name)];
+        NSString *description = infoField(info, "Description");
+        if (!description) {
+            info = [NSString stringWithContentsOfFile:
+                infoPath([receiptRoot stringByAppendingPathComponent:leaf], name)];
+            description = infoField(info, "Description");
+        }
+        if (description) {
+            if ([names count] > 1) {
+                NSString *title = infoField(info, "Title");
+                description = [NSString stringWithFormat:@"%@: %@", title ? title : name, description];
+            }
+            [parts addObject:description];
+        }
+    }
+    return [parts count] ? [parts componentsJoinedByString:@"\n\n"] : nil;
+}
+
 static BOOL receiptLocationMatches(NSDictionary *package, NSString *info, NSString *location)
 {
     NSString *expected = infoField(info, "DefaultLocation");
@@ -136,6 +163,14 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     return trim([[[NSString alloc] initWithData:data encoding:NSNEXTSTEPStringEncoding] autorelease]);
 }
 
+/* Keep short package lists at the top when the viewport grows taller. */
+@interface PackageListView : NSView
+@end
+
+@implementation PackageListView
+- (BOOL)isFlipped { return YES; }
+@end
+
 @interface SetupController : NSObject
 {
     NSWindow *window;
@@ -146,9 +181,9 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     NSString *cdRoot, *packageRoot, *active;
     NSDictionary *beforeReceipt, *candidateReceipt;
     NSTimer *timer;
-    NSTask *picTask, *installerTask;
+    NSTask *picTask, *installerTask, *postInstallTask;
     NSPipe *picOutput;
-    NSMutableSet *available, *installed, *selected;
+    NSMutableSet *available, *installed, *selected, *postInstallDone;
     BOOL busy, stopRequested, picDone, restartNeeded;
     FILE *log;
     NSString *logPath;
@@ -162,6 +197,9 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 - (void)quit:(id)sender;
 - (void)poll:(NSTimer *)sender;
 - (void)checkInstaller;
+- (NSSet *)completed;
+- (void)startPostInstall;
+- (BOOL)windowShouldClose:(id)sender;
 - (BOOL)applicationShouldTerminate:(NSApplication *)application;
 @end
 
@@ -203,6 +241,24 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         if ([self matchingReceipt:name]) [installed addObject:name];
     }
 }
+- (NSSet *)completed
+{
+    NSMutableSet *result = [NSMutableSet setWithSet:installed];
+    NSEnumerator *packages = [[model packages] objectEnumerator];
+    NSDictionary *package;
+    while ((package = [packages nextObject]))
+        if ([[package objectForKey:@"PostInstall"] count] &&
+            ![postInstallDone containsObject:[package objectForKey:@"Name"]])
+            [result removeObject:[package objectForKey:@"Name"]];
+    return result;
+}
+- (NSArray *)plan:(NSSet *)requested missing:(NSMutableSet *)missing
+{
+    NSMutableSet *present = [NSMutableSet setWithSet:available];
+    /* An installed package with an unfinished action needs no reinstall. */
+    [present unionSet:installed];
+    return [model plan:requested available:present installed:[self completed] missing:missing];
+}
 - (BOOL)prepare
 {
     NSString *bundle = [[NSBundle mainBundle] bundlePath];
@@ -235,6 +291,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     }
     available = [[NSMutableSet alloc] init]; installed = [[NSMutableSet alloc] init];
     selected = [[NSMutableSet alloc] init];
+    postInstallDone = [[NSMutableSet alloc] init];
     rows = [[NSMutableArray alloc] init]; visibleChoices = [[NSMutableArray alloc] init];
     logPath = [[NSString stringWithFormat:@"/private/tmp/Setup.%ld.log", (long)getpid()] retain];
     fd = open([logPath cString], O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -259,8 +316,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
                 [selected addObjectsFromArray:[choice objectForKey:@"Packages"]];
         }
     }
-    [selected setSet:[NSSet setWithArray:[model plan:selected available:available installed:installed
-                                                   missing:[NSMutableSet set]]]];
+    [selected setSet:[NSSet setWithArray:[self plan:selected missing:[NSMutableSet set]]]];
     return YES;
 }
 - (NSTextField *)label:(NSString *)title frame:(NSRect)frame bold:(BOOL)bold in:(NSView *)parent
@@ -284,10 +340,11 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 - (void)updateRows
 {
     int i;
+    NSSet *completed = [self completed];
     for (i = 0; i < [rows count]; ++i) {
         NSDictionary *choice = [visibleChoices objectAtIndex:i];
         NSSet *names = [NSSet setWithArray:[choice objectForKey:@"Packages"]];
-        BOOL done = [names isSubsetOfSet:installed];
+        BOOL done = [names isSubsetOfSet:completed];
         NSButton *row = [rows objectAtIndex:i];
         NSString *title = [choice objectForKey:@"Title"];
         [row setState:done || [names intersectsSet:selected]];
@@ -302,44 +359,61 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 {
     int i;
     float height = 0, y;
+    unsigned int style = NSTitledWindowMask | NSClosableWindowMask | NSMiniaturizableWindowMask | NSResizableWindowMask;
+    NSRect minimum = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, 400, 320) styleMask:style];
     NSString *category = nil;
     NSScrollView *scroll;
     NSView *content;
+    NSTextField *instructions;
     window = [[NSWindow alloc] initWithContentRect:NSMakeRect(80, 60, 460, 430)
-        styleMask:NSTitledWindowMask | NSMiniaturizableWindowMask
-        backing:NSBackingStoreBuffered defer:NO];
+        styleMask:style backing:NSBackingStoreBuffered defer:NO];
     [window setTitle:@"OPENSTEP Setup"];
-    [self label:@"Select additional software to install.\nComplete each installation, then quit Installer; Setup opens the next package automatically."
+    [window setDelegate:self]; [window setReleasedWhenClosed:NO];
+    [window setMinSize:minimum.size];
+    [[window contentView] setAutoresizesSubviews:YES];
+    instructions = [self label:@"Select additional software to install.\nComplete each installation, then quit Installer; Setup opens the next package automatically."
                frame:NSMakeRect(14, 362, 432, 54) bold:NO in:[window contentView]];
+    [instructions setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
     for (i = 0; i < [visibleChoices count]; ++i) {
         NSString *next = [[visibleChoices objectAtIndex:i] objectForKey:@"Category"];
         height += [next isEqualToString:category] ? 22 : 44;
         category = next;
     }
-    height = MAX(height, 245); y = height - 22; category = nil;
+    y = 2; category = nil;
     scroll = [[[NSScrollView alloc] initWithFrame:NSMakeRect(14, 110, 432, 245)] autorelease];
+    [scroll setBorderType:NSBezelBorder];
     [scroll setHasVerticalScroller:YES];
-    content = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 410, height)] autorelease];
+    [scroll setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    height = MAX(height + 2, [scroll contentSize].height);
+    content = [[[PackageListView alloc] initWithFrame:NSMakeRect(0, 0, [scroll contentSize].width, height)] autorelease];
+    [content setAutoresizingMask:NSViewWidthSizable];
     for (i = 0; i < [visibleChoices count]; ++i) {
         NSDictionary *choice = [visibleChoices objectAtIndex:i];
         NSButton *row;
         if (![[choice objectForKey:@"Category"] isEqualToString:category]) {
+            NSTextField *heading;
             category = [choice objectForKey:@"Category"];
-            [self label:category frame:NSMakeRect(6, y, 400, 19) bold:YES in:content]; y -= 22;
+            heading = [self label:category frame:NSMakeRect(6, y, NSWidth([content bounds]) - 12, 19) bold:YES in:content];
+            [heading setAutoresizingMask:NSViewWidthSizable]; y += 22;
         }
-        row = [[[NSButton alloc] initWithFrame:NSMakeRect(14, y, 396, 20)] autorelease];
+        row = [[[NSButton alloc] initWithFrame:NSMakeRect(14, y, NSWidth([content bounds]) - 14, 20)] autorelease];
+        [row setAutoresizingMask:NSViewWidthSizable];
         [row setButtonType:NSSwitchButton]; [row setFont:[NSFont systemFontOfSize:12]];
         [row setImagePosition:NSImageLeft]; [row setAlignment:NSLeftTextAlignment];
+        [row setToolTip:choiceDescription(choice, packageRoot, @"/NextLibrary/Receipts")];
         [row setTarget:self]; [row setAction:@selector(selectionChanged:)];
-        [content addSubview:row]; [rows addObject:row]; y -= 22;
+        [content addSubview:row]; [rows addObject:row]; y += 22;
     }
     [scroll setDocumentView:content]; [[window contentView] addSubview:scroll];
-    [content scrollPoint:NSMakePoint(0, height - 245)];
+    [content scrollPoint:NSMakePoint(0, 0)];
     status = [self label:@"" frame:NSMakeRect(14, 57, 432, 44) bold:NO in:[window contentView]];
+    [status setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
     quitButton = [[NSButton alloc] initWithFrame:NSMakeRect(244, 15, 94, 28)];
+    [quitButton setAutoresizingMask:NSViewMinXMargin | NSViewMaxYMargin];
     [quitButton setTitle:@"Quit"]; [quitButton setTarget:self]; [quitButton setAction:@selector(quit:)];
     [[window contentView] addSubview:quitButton];
     installButton = [[NSButton alloc] initWithFrame:NSMakeRect(342, 15, 104, 28)];
+    [installButton setAutoresizingMask:NSViewMinXMargin | NSViewMaxYMargin];
     [installButton setTitle:@"Install"]; [installButton setTarget:self]; [installButton setAction:@selector(install:)];
     [[window contentView] addSubview:installButton];
     [self updateRows];
@@ -357,14 +431,14 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         if ([row state] && [row isEnabled])
             [requested addObjectsFromArray:[[visibleChoices objectAtIndex:i] objectForKey:@"Packages"]];
     }
-    work = [model plan:requested available:available installed:installed missing:missing];
+    work = [self plan:requested missing:missing];
     if ([missing count]) {
         NSMutableString *message = [NSMutableString stringWithString:@"Required packages are neither installed nor on this CD:\n"];
         for (i = 0; i < [work count]; ++i)
             if ([missing containsObject:[work objectAtIndex:i]]) [message appendFormat:@"\n%@", [work objectAtIndex:i]];
         [self alert:message];
     } else {
-        [selected setSet:[NSSet setWithArray:work]]; [requested minusSet:installed];
+        [selected setSet:[NSSet setWithArray:work]]; [requested minusSet:[self completed]];
         if (![selected isEqualToSet:requested])
             [self message:@"Required packages have been selected. Uncheck their dependents first to remove them."];
     }
@@ -376,7 +450,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     [timer invalidate]; timer = nil;
     [beforeReceipt release]; beforeReceipt = nil;
     [candidateReceipt release]; candidateReceipt = nil;
-    [self scanInstalled]; [selected minusSet:installed];
+    [self scanInstalled]; [selected minusSet:[self completed]];
     [installButton setTitle:@"Retry"];
     [self updateRows]; [self message:reason];
     [self alert:[NSString stringWithFormat:@"%@\n\nLog: %@", reason, logPath]];
@@ -399,11 +473,40 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         [self pause:@"Could not launch the PIC helper. Do not reboot before fixing the kernel."];
     NS_ENDHANDLER
 }
+- (void)startPostInstall
+{
+    NSArray *command = [[model package:active] objectForKey:@"PostInstall"];
+    [self message:[NSString stringWithFormat:@"Running post-install action for %@: %@", active,
+        [command componentsJoinedByString:@" "]]];
+    postInstallTask = [[NSTask alloc] init];
+    [postInstallTask setLaunchPath:[command objectAtIndex:0]];
+    [postInstallTask setArguments:[command subarrayWithRange:NSMakeRange(1, [command count] - 1)]];
+    NS_DURING
+        if (cdRoot) [postInstallTask setCurrentDirectoryPath:cdRoot];
+        if (log) {
+            /* Share the log offset; a pipe could fill while we wait for exit. */
+            int fd = dup(fileno(log));
+            NSFileHandle *output;
+            if (fd < 0) [NSException raise:@"SetupLogError" format:@"Cannot duplicate the Setup log descriptor."];
+            output = [[[NSFileHandle alloc] initWithFileDescriptor:fd closeOnDealloc:YES] autorelease];
+            [postInstallTask setStandardOutput:output]; [postInstallTask setStandardError:output];
+        }
+        [postInstallTask launch];
+    NS_HANDLER
+        [postInstallTask release]; postInstallTask = nil;
+        [self pause:[NSString stringWithFormat:@"Could not run the post-install action for %@: %@. Retry before rebooting.",
+            active, [localException reason]]];
+    NS_ENDHANDLER
+}
+- (void)finishPackage
+{
+    [pending removeObjectAtIndex:0]; [selected removeObject:active];
+    [active release]; active = nil;
+}
 - (void)advance
 {
     NSString *path;
     if ([self needsPIC]) { [self startPIC]; return; }
-    if (stopRequested) [pending removeAllObjects];
     if ([installerTask isRunning]) {
         [self message:stopRequested ? @"Quit Installer to finish stopping Setup." :
             [pending count] ? @"Installation complete. Quit Installer to open the next selected package." :
@@ -411,9 +514,21 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         return;
     }
     [installerTask release]; installerTask = nil;
+    /* Finish an installed package's action even after Stop, but never before
+     * its prerequisites or while Installer can still change its files. */
+    if ([pending count]) {
+        NSString *name = [pending objectAtIndex:0];
+        NSDictionary *package = [model package:name];
+        if ([installed containsObject:name] && [[package objectForKey:@"PostInstall"] count] &&
+            ![postInstallDone containsObject:name] &&
+            [[NSSet setWithArray:[package objectForKey:@"Dependencies"]] isSubsetOfSet:[self completed]]) {
+            active = [name retain]; [self startPostInstall]; return;
+        }
+    }
+    if (stopRequested) [pending removeAllObjects];
     if (![pending count]) {
         busy = NO; [timer invalidate]; timer = nil;
-        [self scanInstalled]; [selected minusSet:installed];
+        [self scanInstalled]; [selected minusSet:[self completed]];
         [installButton setTitle:@"Install"]; [self updateRows];
         [self message:stopRequested ? @"Stopped. Remaining packages were not started." : @"Selected packages are installed."];
         [self alert:[NSString stringWithFormat:@"%@%@\n\nLog: %@",
@@ -445,7 +560,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     if (busy) return;
     [self scanInstalled];
     [pending release];
-    pending = [[model plan:selected available:available installed:installed missing:missing] mutableCopy];
+    pending = [[self plan:selected missing:missing] mutableCopy];
     if ([missing count]) { [self alert:@"A prerequisite is missing. Review the package selection."]; return; }
     [selected setSet:[NSSet setWithArray:pending]];
     busy = YES; stopRequested = NO;
@@ -467,10 +582,13 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 {
     NSDictionary *package = [model package:active];
     [self message:[NSString stringWithFormat:@"Installed %@", active]];
-    [installed addObject:active]; [pending removeObjectAtIndex:0]; [selected removeObject:active];
+    [installed addObject:active];
     if ([[package objectForKey:@"FixPICAfter"] isEqual:@"YES"]) picDone = NO;
     if ([[package objectForKey:@"RestartRequired"] isEqual:@"YES"]) restartNeeded = YES;
-    [active release]; active = nil;
+    if ([[package objectForKey:@"PostInstall"] count]) {
+        [postInstallDone removeObject:active];
+        [active release]; active = nil;
+    } else [self finishPackage];
     [beforeReceipt release]; beforeReceipt = nil;
     [candidateReceipt release]; candidateReceipt = nil;
     [self advance];
@@ -489,6 +607,19 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
                 [self pause:[NSString stringWithFormat:@"PIC patching failed. Do not reboot yet.\n%@", output]];
             } else { picDone = YES; [self message:@"Kernel PIC fix verified."]; [self advance]; }
         }
+    } else if (postInstallTask) {
+        if (![postInstallTask isRunning]) {
+            int code = [postInstallTask terminationStatus];
+            [postInstallTask release]; postInstallTask = nil;
+            if (code != 0) {
+                [self pause:[NSString stringWithFormat:@"Post-install action for %@ failed (exit %d). Retry before rebooting; see the log for details.", active, code]];
+            } else {
+                [self message:[NSString stringWithFormat:@"Post-install action for %@ completed.", active]];
+                [postInstallDone addObject:active];
+                if ([[[model package:active] objectForKey:@"RestartRequired"] isEqual:@"YES"]) restartNeeded = YES;
+                [self finishPackage]; [self advance];
+            }
+        }
     } else if (active) [self checkInstaller];
     else if (![installerTask isRunning]) [self advance];
 }
@@ -506,6 +637,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         stopRequested = YES;
         [self updateRows];
         if (picTask) [self message:@"Stopping after the kernel PIC check finishes..."];
+        else if (postInstallTask) [self message:@"Stopping after the post-install action finishes..."];
         else {
             [self message:@"No further packages will open. Finish or cancel the current operation in Installer, then quit Installer."];
             if (active) [self checkInstaller];
@@ -516,7 +648,13 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 - (BOOL)applicationShouldTerminate:(NSApplication *)application
 {
     if (!busy) return YES;
-    [self alert:@"An installation or kernel patch is still active. Use Stop; finish or cancel the current installation in Installer. Setup must finish the PIC check before exiting."];
+    [self alert:@"An installation or post-install action is still active. Use Stop; finish or cancel the current installation in Installer. Setup must finish any active patches before exiting."];
+    return NO;
+}
+- (BOOL)windowShouldClose:(id)sender
+{
+    /* Use the application's quit path, including its active-install guard. */
+    [NSApp terminate:self];
     return NO;
 }
 - (void)dealloc
@@ -525,10 +663,11 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     if (log) fclose(log);
     [model release]; [available release]; [installed release]; [selected release];
     [rows release]; [visibleChoices release]; [pending release]; [active release];
-    [window release]; [quitButton release]; [installButton release];
+    [window setDelegate:nil]; [window release]; [quitButton release]; [installButton release];
     [cdRoot release]; [packageRoot release]; [logPath release];
     [beforeReceipt release]; [candidateReceipt release];
     [picTask release]; [picOutput release]; [installerTask release];
+    [postInstallTask release]; [postInstallDone release];
     [super dealloc];
 }
 @end

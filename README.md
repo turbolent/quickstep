@@ -45,6 +45,11 @@ python3 build_cd.py \
 - `--optional-driver-package /path/to/Driver.pkg`: copy an optional driver package to `/NextCD/Packages` and list it under **Drivers** when Setup.app is included.
   Repeat the flag for additional packages; single-package tar archives are also accepted.
   These choices are unchecked by default and do not change the boot-floppy drivers.
+- `--framebuffer-wc ../FramebufferWC/FramebufferWC-0.27.pkg.tar.gz`: include FramebufferWC as an optional **Drivers** choice in Setup.
+  Use with `--setup-app` and `--user-patch` (or an already-installed User Patch 4).
+  Selecting it installs User Patch 4 first if needed, then FramebufferWC, patches VBE, and activates both drivers in load order.
+  Missing driver instances are copied from their default tables; existing instance settings are preserved.
+  Reboot afterward to use the drivers.
 - `--remove-language-packages`: remove additional language packages and their receipt entries from the generated CD.
   English and existing localized files in the base system are retained.
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.
@@ -62,3 +67,6 @@ The package itself is not modified.
 ### Setup.app
 
 When included, open Setup.app from the mounted CD after booting and configuring the installed system, logged in as root.
+FramebufferWC is unchecked by default and is not installed or activated by building or booting the CD.
+If its post-install action fails, Setup offers Retry without reinstalling the package.
+Selecting it again in a later Setup session safely reapplies the patch and activation, including after reinstalling User Patch 4.

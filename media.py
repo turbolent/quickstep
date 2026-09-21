@@ -1447,6 +1447,7 @@ class SetupPackage:
     relocatable: bool = False
     restart_required: bool = False
     fix_pic_after: bool = False
+    post_install: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1486,6 +1487,8 @@ def setup_plist(catalog: SetupCatalog, *, fix_pic_bug: bool = False) -> bytes:
             raise ValueError(f"invalid Setup package name: {package.name!r}")
         if any(name not in packages for name in package.dependencies):
             raise ValueError(f"unknown dependency of Setup package {package.name}")
+        if package.post_install and not package.post_install[0].startswith("/"):
+            raise ValueError(f"Setup post-install executable must be absolute: {package.name}")
     resolved: set[str] = set()
     while len(resolved) < len(packages):
         ready = {p.name for p in catalog.packages if set(p.dependencies) <= resolved} - resolved
@@ -1499,7 +1502,8 @@ def setup_plist(catalog: SetupCatalog, *, fix_pic_bug: bool = False) -> bytes:
     for package in catalog.packages:
         lines.append("        { " + f"Name = {quote(package.name)}; Version = {quote(package.version)}; "
                      f"Dependencies = {names(package.dependencies)}; Relocatable = {flag(package.relocatable)}; "
-                     f"RestartRequired = {flag(package.restart_required)}; FixPICAfter = {flag(package.fix_pic_after)}; " + "},")
+                     f"RestartRequired = {flag(package.restart_required)}; FixPICAfter = {flag(package.fix_pic_after)}; "
+                     f"PostInstall = {names(package.post_install)}; " + "},")
     lines.append("    );\n    Choices = (")
     for choice in catalog.choices:
         lines.append("        { " + f"Category = {quote(choice.category)}; Title = {quote(choice.title)}; "
