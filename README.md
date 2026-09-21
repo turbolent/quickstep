@@ -40,6 +40,8 @@ python3 build_cd.py \
 - `--developer-cd /path/to/Developer.iso`: include the Developer CD packages.
 - `--user-patch /path/to/OS42MachUserPatch4.tar`: include User Patch 4.
 - `--developer-patch /path/to/OS42MachDevPatch4.tar`: include Developer Patch 4.
+- `--profile-libs-patch /path/to/OS42MachPLibPatch4.tar`: include Profiling Libraries Patch 4.
+- `--setup-app /path/to/Setup.app`: include the native post-installation package selector (see [building Setup.app](setup/README.md)).
 - `--remove-language-packages`: remove additional language packages and their receipt entries from the generated CD.
   English and existing localized files in the base system are retained.
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.
@@ -53,3 +55,7 @@ If you built with `--fix-pic-bug`, run `/usr/bin/fix-pic-bug` as root after inst
 The helper supports stock OPENSTEP 4.2 and Patch 4 kernels, leaves already-patched kernels unchanged, and refuses unknown kernels.
 It saves the original as `/mach_kernel.pre-pic-fix` without overwriting an existing backup.
 The package itself is not modified.
+
+### Setup.app
+
+When included, open Setup.app from the mounted CD after booting and configuring the installed system, logged in as root.

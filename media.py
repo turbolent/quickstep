@@ -32,6 +32,8 @@ __all__ = [
     "prepare_installation_drivers", "verify_boot_cd",
     "skip_boot_language_selection",
     "remove_language_packages", "patch_builddisk_language_heading",
+    "SetupPackage", "SetupChoice", "SetupCatalog", "setup_plist",
+    "validate_setup_app", "prepare_setup_app", "verify_setup_app",
     "copy_directory", "verify_directory_copy",
     "copy_tar", "verify_tar_copy", "tar_entries",
     "MAX_GROWN_FLOPPY_KIB", "MAX_BOOT_FLOPPY_KIB",
@@ -1435,6 +1437,160 @@ def verify_tar_copy(archive: PathInput, target_image: PathInput, target_path: st
             _verify_metadata(entry, actual, path)
             if not entry.is_dir and (actual.size != entry.size or target.read(path, actual) != _tar_read(source, item)):
                 raise ValueError(f"imported tar file contents differ: {path}")
+
+
+@dataclass(frozen=True)
+class SetupPackage:
+    name: str
+    version: str
+    dependencies: tuple[str, ...] = ()
+    relocatable: bool = False
+    restart_required: bool = False
+    fix_pic_after: bool = False
+
+
+@dataclass(frozen=True)
+class SetupChoice:
+    category: str
+    title: str
+    packages: tuple[str, ...]
+    default_selected: bool = False
+
+
+@dataclass(frozen=True)
+class SetupCatalog:
+    packages: tuple[SetupPackage, ...]
+    choices: tuple[SetupChoice, ...]
+
+
+def setup_plist(catalog: SetupCatalog, *, fix_pic_bug: bool = False) -> bytes:
+    """Validate and serialize a catalog using OPENSTEP's ASCII plist syntax."""
+    def quote(value: str) -> str:
+        if not value or any(not 32 <= ord(c) < 127 for c in value):
+            raise ValueError("Setup catalog strings must be nonempty printable ASCII")
+        return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    def names(values: tuple[str, ...]) -> str:
+        return "(" + ", ".join(quote(value) for value in values) + ")"
+
+    def flag(value: bool) -> str:
+        if type(value) is not bool:
+            raise ValueError("Setup catalog flags must be booleans")
+        return "YES" if value else "NO"
+
+    packages = {package.name: package for package in catalog.packages}
+    if len(packages) != len(catalog.packages):
+        raise ValueError("duplicate Setup package name")
+    for package in catalog.packages:
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]+", package.name) or package.name in (".", ".."):
+            raise ValueError(f"invalid Setup package name: {package.name!r}")
+        if any(name not in packages for name in package.dependencies):
+            raise ValueError(f"unknown dependency of Setup package {package.name}")
+    resolved: set[str] = set()
+    while len(resolved) < len(packages):
+        ready = {p.name for p in catalog.packages if set(p.dependencies) <= resolved} - resolved
+        if not ready:
+            raise ValueError("cycle in Setup package dependencies")
+        resolved.update(ready)
+    for choice in catalog.choices:
+        if not choice.packages or any(name not in packages for name in choice.packages):
+            raise ValueError(f"empty or unknown packages in Setup choice: {choice.title}")
+    lines = ["{", "    FormatVersion = 1;", f"    FixPICBug = {flag(fix_pic_bug)};", "    Packages = ("]
+    for package in catalog.packages:
+        lines.append("        { " + f"Name = {quote(package.name)}; Version = {quote(package.version)}; "
+                     f"Dependencies = {names(package.dependencies)}; Relocatable = {flag(package.relocatable)}; "
+                     f"RestartRequired = {flag(package.restart_required)}; FixPICAfter = {flag(package.fix_pic_after)}; " + "},")
+    lines.append("    );\n    Choices = (")
+    for choice in catalog.choices:
+        lines.append("        { " + f"Category = {quote(choice.category)}; Title = {quote(choice.title)}; "
+                     f"Packages = {names(choice.packages)}; DefaultSelected = {flag(choice.default_selected)}; " + "},")
+    lines.append("    );\n}\n")
+    return "\n".join(lines).encode("ascii")
+
+
+@dataclass(frozen=True)
+class _SetupFile:
+    name: str
+    mode: int
+    data: bytes = b""
+
+
+def _setup_files(bundle: PathInput, configuration: bytes | None = None) -> list[_SetupFile]:
+    root = Path(bundle)
+    if root.name != "Setup.app" or not stat.S_ISDIR(local_stat(root).st_mode):
+        raise ValueError(f"expected a Setup.app directory: {root}")
+    result: list[_SetupFile] = []
+
+    def visit(path: Path, name: str) -> None:
+        mode = local_stat(path).st_mode
+        if name in ("Setup.app/Setup.plist", "Setup.app/Setup.options"):
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"{name} is reserved for the generated configuration file")
+            return
+        if stat.S_ISDIR(mode):
+            result.append(_SetupFile(name, stat.S_IFDIR | 0o755))
+            for child in sorted(path.iterdir()):
+                component(child.name)
+                visit(child, name + "/" + child.name)
+        elif stat.S_ISREG(mode):
+            permissions = 0o755 if name == "Setup.app/Setup" else 0o644
+            result.append(_SetupFile(name, stat.S_IFREG | permissions, path.read_bytes()))
+        else:
+            raise ValueError(f"unsupported Setup.app file: {path}")
+
+    visit(root, "Setup.app")
+    executable_file = next((item for item in result if item.name == "Setup.app/Setup"), None)
+    if executable_file is None or not stat.S_ISREG(executable_file.mode):
+        raise ValueError("Setup.app must contain a regular Setup executable")
+    try:
+        intel = _i386_kernel(executable_file.data)
+        if struct.unpack_from("<I", intel, 12)[0] != 2:  # MH_EXECUTE, not a library/object.
+            raise ValueError("Mach-O file is not an executable")
+    except (ValueError, struct.error) as exc:
+        raise ValueError(f"Setup.app/Setup must be an Intel Mach-O executable: {exc}") from exc
+    if configuration is not None:
+        result.append(_SetupFile("Setup.app/Setup.plist", stat.S_IFREG | 0o644, configuration))
+    return result
+
+
+def validate_setup_app(bundle: PathInput) -> None:
+    """Validate the supplied release bundle without executing it or changing it."""
+    _setup_files(bundle)
+
+
+def prepare_setup_app(bundle: PathInput, user_ufs: PathInput, output: PathInput, *,
+                      catalog: SetupCatalog, fix_pic_bug: bool = False,
+                      nextufs_binary: PathInput | None = None) -> None:
+    """Add a local release bundle and per-CD options to a new UFS copy."""
+    files = _setup_files(bundle, setup_plist(catalog, fix_pic_bug=fix_pic_bug))
+    with tempfile.TemporaryDirectory(prefix="media-setup-") as temp:
+        archive = Path(temp) / "Setup.tar"
+        with tarfile.open(archive, "w") as target:
+            for item in files:
+                member = tarfile.TarInfo(item.name)
+                member.mode = stat.S_IMODE(item.mode)
+                member.type = tarfile.DIRTYPE if stat.S_ISDIR(item.mode) else tarfile.REGTYPE
+                member.size = len(item.data)
+                target.addfile(member, io.BytesIO(item.data) if member.isfile() else None)
+        copy_tar(archive, user_ufs, "/", output, nextufs_binary=nextufs_binary)
+
+
+def verify_setup_app(bundle: PathInput, image: PathInput, *, catalog: SetupCatalog, fix_pic_bug: bool = False,
+                     nextufs_binary: PathInput | None = None) -> None:
+    """Read back the complete bundle, permissions and PIC policy through UFS/ISO."""
+    print("Verifying Setup.app and its CD configuration...", flush=True)
+    expected = _setup_files(bundle, setup_plist(catalog, fix_pic_bug=fix_pic_bug))
+    target = Image(executable(nextufs_binary), image)
+    actual = {"Setup.app" if entry.name == "." else "Setup.app/" + entry.name: entry
+              for entry in target.tree("/Setup.app")}
+    if actual.keys() != {item.name for item in expected}:
+        raise ValueError("Setup.app inventory differs")
+    for item in expected:
+        entry = actual[item.name]
+        if (entry.mode, entry.uid, entry.gid) != (item.mode, 0, 0):
+            raise ValueError(f"Setup.app metadata differs: {item.name}")
+        if not entry.is_dir and target.read("/" + item.name, entry) != item.data:
+            raise ValueError(f"Setup.app contents differ: {item.name}")
 
 
 def resolve_iso_tool(tool: PathInput | None = None, *,

@@ -13,6 +13,30 @@ from media import PathInput
 # Recipe choices: edit these and install_drivers() to build a different CD.
 VOLUME_ID = "OPENSTEP_4_2"
 BOOT_DRIVERS = ("PS2Keyboard", "EISABus", "PCIBus", "Intel824X0", "EIDE")
+SETUP_CATALOG = media.SetupCatalog(
+    packages=(
+        media.SetupPackage("OS42MachUserPatch4", "OPENSTEP Release 4.2 Patch 4",
+                           restart_required=True, fix_pic_after=True),
+        media.SetupPackage("DeveloperTools", "OPENSTEP 4.2 for Mach"),
+        media.SetupPackage("DeveloperLibs", "OPENSTEP 4.2 for Mach", ("DeveloperTools",)),
+        media.SetupPackage("OS42MachDeveloperPatch4", "OPENSTEP Release 4.2 Developer Patch 4",
+                           ("OS42MachUserPatch4", "DeveloperTools", "DeveloperLibs"), restart_required=True),
+        media.SetupPackage("DeveloperDoc", "OPENSTEP 4.2 for Mach"),
+        media.SetupPackage("ProfileLibs", "OPENSTEP 4.2 for Mach"),
+        media.SetupPackage("OS42MachProfileLibPatch4", "OPENSTEP Release 4.2 ProfileLib Patch 4",
+                           ("OS42MachDeveloperPatch4", "ProfileLibs"), restart_required=True),
+        media.SetupPackage("GNUSource", "OPENSTEP 4.2 for Mach", relocatable=True),
+    ),
+    choices=(
+        media.SetupChoice("System Software", "User Patch 4", ("OS42MachUserPatch4",), default_selected=True),
+        media.SetupChoice("Developer Software", "Developer Tools and Libraries", ("DeveloperTools", "DeveloperLibs")),
+        media.SetupChoice("Developer Software", "Developer Tools and Libraries Patch 4", ("OS42MachDeveloperPatch4",)),
+        media.SetupChoice("Developer Software", "Developer Documentation", ("DeveloperDoc",)),
+        media.SetupChoice("Profiling", "Profiling Libraries", ("ProfileLibs",)),
+        media.SetupChoice("Profiling", "Profiling Libraries Patch 4", ("OS42MachProfileLibPatch4",)),
+        media.SetupChoice("Source Code", "GNU Source", ("GNUSource",)),
+    ),
+)
 
 
 def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInput | None,
@@ -95,7 +119,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           nextufs_binary: PathInput | None = None, bus_master_ide: PathInput | None = None,
           fix_pic_bug: bool = False, developer_cd: PathInput | None = None,
           user_patch: PathInput | None = None, developer_patch: PathInput | None = None,
-          remove_language_packages: bool = False) -> None:
+          remove_language_packages: bool = False, setup_app: PathInput | None = None,
+          profile_libs_patch: PathInput | None = None) -> None:
     """Build and check the complete ISO; keep intermediates only until publication."""
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
@@ -103,17 +128,21 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
     for label, path in (("boot disk", boot_disk), ("driver disk", driver_disk),
                         ("beta disk", beta_disk), ("User CD", user_cd),
                         ("Developer CD", developer_cd), ("User patch", user_patch),
-                        ("Developer patch", developer_patch)):
+                        ("Developer patch", developer_patch), ("Profiling libraries patch", profile_libs_patch)):
         if path is not None and not Path(path).is_file():
             raise ValueError(f"{label} must be a regular file: {path}")
     if bus_master_ide is not None:
         package_path = Path(bus_master_ide)
         if not (package_path.is_file() or (package_path.is_dir() and package_path.name.endswith(".pkg"))):
             raise ValueError(f"BusMasterIDE must be a .pkg directory or package archive: {bus_master_ide}")
+    if setup_app is not None:
+        media.validate_setup_app(setup_app)
+        media.setup_plist(SETUP_CATALOG, fix_pic_bug=fix_pic_bug)
     nextufs_binary = media.executable(nextufs_binary)
     iso_tool = media.resolve_iso_tool(iso_tool, nextufs_binary=nextufs_binary)
     patches = ((user_patch, "OS42MachUserPatch4.pkg"),
-               (developer_patch, "OS42MachDeveloperPatch4.pkg"))
+               (developer_patch, "OS42MachDeveloperPatch4.pkg"),
+               (profile_libs_patch, "OS42MachProfileLibPatch4.pkg"))
     for archive, package in patches:
         if archive is not None:
             print(f"Checking patch archive {archive}...", flush=True)
@@ -183,6 +212,12 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                 media.copy_tar(archive, installer, "/NextCD/Packages", patched_ufs,
                                nextufs_binary=nextufs_binary)
                 installer = patched_ufs
+        if setup_app is not None:
+            print("Adding Setup.app for post-installation package setup...", flush=True)
+            with_setup = iso.parent / "setup.ufs"
+            media.prepare_setup_app(setup_app, installer, with_setup, catalog=SETUP_CATALOG, fix_pic_bug=fix_pic_bug,
+                                    nextufs_binary=nextufs_binary)
+            installer = with_setup
         print(f"Building ISO: {output}...", flush=True)
         media.create_iso(boot, user_cd, installer, iso, volume_id=VOLUME_ID, iso_tool=iso_tool,
                          nextufs_binary=nextufs_binary)
@@ -196,6 +231,9 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         for archive, _ in patches:
             if archive is not None:
                 media.verify_tar_copy(archive, iso, "/NextCD/Packages", nextufs_binary=nextufs_binary)
+        if setup_app is not None:
+            media.verify_setup_app(setup_app, iso, catalog=SETUP_CATALOG, fix_pic_bug=fix_pic_bug,
+                                   nextufs_binary=nextufs_binary)
     print(f"Created bootable ISO: {output}")
 
 
@@ -214,6 +252,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="Developer CD image whose packages will be included for manual installation")
     parser.add_argument("--user-patch", type=Path, help="OS42MachUserPatch4.tar to include for manual installation")
     parser.add_argument("--developer-patch", type=Path, help="OS42MachDevPatch4.tar to include for manual installation")
+    parser.add_argument("--profile-libs-patch", type=Path,
+                        help="OS42MachPLibPatch4.tar to include for manual installation")
+    parser.add_argument("--setup-app", type=Path, metavar="Setup.app",
+                        help="native Setup.app release bundle to include for post-installation package setup")
     parser.add_argument("--fix-pic-bug", action="store_true",
                         help="apply the PIC interrupt fix to the boot and installed kernels")
     parser.add_argument("--remove-language-packages", action="store_true",
@@ -230,7 +272,8 @@ def main(argv: Sequence[str] | None = None) -> int:
               user_cd=args.user_cd, output=args.output, iso_tool=args.iso_tool, nextufs_binary=args.nextufs,
               bus_master_ide=args.bus_master_ide, fix_pic_bug=args.fix_pic_bug, developer_cd=args.developer_cd,
               user_patch=args.user_patch, developer_patch=args.developer_patch,
-              remove_language_packages=args.remove_language_packages)
+              remove_language_packages=args.remove_language_packages, setup_app=args.setup_app,
+              profile_libs_patch=args.profile_libs_patch)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"build_cd.py: {exc}\n")
     return 0

@@ -1,0 +1,15 @@
+{
+    FormatVersion = 1;
+    FixPICBug = YES;
+    Packages = (
+        { Name = Patch; Version = 2; Dependencies = (Libs, Base); Relocatable = NO; RestartRequired = YES; FixPICAfter = YES; },
+        { Name = Libs; Version = 1; Dependencies = (Tools); Relocatable = NO; RestartRequired = NO; FixPICAfter = NO; },
+        { Name = Tools; Version = 1; Dependencies = (); Relocatable = NO; RestartRequired = NO; FixPICAfter = NO; },
+        { Name = Base; Version = 1; Dependencies = (); Relocatable = NO; RestartRequired = NO; FixPICAfter = NO; },
+    );
+    Choices = (
+        { Category = System; Title = Base; Packages = (Base); DefaultSelected = YES; },
+        { Category = Developer; Title = "Tools and Libraries"; Packages = (Tools, Libs); DefaultSelected = NO; },
+        { Category = Developer; Title = Patch; Packages = (Patch); DefaultSelected = NO; },
+    );
+}
