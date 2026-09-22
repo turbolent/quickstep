@@ -2,6 +2,10 @@
 CC = cc
 CFLAGS = -arch i386 -O -Wall
 APP = build/Setup.app
+APP_ICON = /usr/lib/NextStep/Workspace.app/application.tiff
+# Workspace identifies GUI applications through the executable's __ICON data.
+APP_ICON_FLAGS = -sectcreate __ICON __header Setup.iconheader \
+	-sectcreate __ICON app $(APP_ICON) -segprot __ICON r r
 
 all: $(APP)/Setup $(APP)/setup-framebuffer-wc.sh
 
@@ -10,11 +14,11 @@ $(APP)/setup-framebuffer-wc.sh: setup-framebuffer-wc.sh
 	/bin/cp setup-framebuffer-wc.sh $@
 	/bin/rm -f $(APP)/setup-framebuffer-wc.pl
 
-$(APP)/Setup: main.m SetupModel.m SetupModel.h
+$(APP)/Setup: main.m SetupModel.m SetupModel.h Setup.iconheader $(APP_ICON) Makefile
 	/bin/mkdirs $(APP)
-	$(CC) $(CFLAGS) -o $@ main.m SetupModel.m -framework AppKit -framework Foundation
+	$(CC) $(CFLAGS) $(APP_ICON_FLAGS) -o $@ main.m SetupModel.m -framework AppKit -framework Foundation
 
-test: build/test_model build/test_controller
+test: $(APP)/Setup build/test_model build/test_controller
 	./build/test_model
 	./build/test_controller
 

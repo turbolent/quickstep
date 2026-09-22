@@ -2,8 +2,86 @@
 #import "main.m"
 #undef main
 #include <assert.h>
+#include <mach-o/loader.h>
 
 static const char *testPackage = "/Test CD/Patch 'quoted'; name.pkg";
+
+static void testBundle(void)
+{
+    NSData *binary = [NSData dataWithContentsOfFile:@"build/Setup.app/Setup"];
+    NSData *expected = [NSData dataWithContentsOfFile:@"Setup.iconheader"];
+    const struct mach_header *header = [binary bytes];
+    const struct section *section;
+    const unsigned char *icon;
+    unsigned int i;
+    assert([binary length] >= sizeof(*header));
+    assert(header->magic == MH_MAGIC && header->filetype == MH_EXECUTE);
+    assert(header->sizeofcmds <= [binary length] - sizeof(*header));
+    section = getsectbynamefromheader(header, "__ICON", "__header");
+    assert(section && section->offset <= [binary length]);
+    assert(section->size <= [binary length] - section->offset);
+    assert([expected length] && section->size >= [expected length]);
+    icon = (const unsigned char *)header + section->offset;
+    assert(!memcmp(icon, [expected bytes], [expected length]));
+    for (i = [expected length]; i < section->size; ++i) assert(icon[i] == 0);
+    section = getsectbynamefromheader(header, "__ICON", "app");
+    assert(section && section->offset <= [binary length]);
+    assert(section->size >= 8 && section->size <= [binary length] - section->offset);
+    icon = (const unsigned char *)header + section->offset;
+    assert(!memcmp(icon, "II\052\0", 4) || !memcmp(icon, "MM\0\052", 4));
+}
+
+/* Check startup ordering without opening windows or reading CD contents. */
+@interface StartupProbe : SetupController
+{
+    int mode, phase;
+}
+- (id)initWithMode:(int)value;
+- (void)terminate:(id)sender;
+- (int)phase;
+@end
+
+@implementation StartupProbe
+- (id)initWithMode:(int)value { self = [super init]; mode = value; return self; }
+- (void)show { assert(phase == 0); phase = 1; }
+- (BOOL)prepare
+{
+    assert(phase == 1); phase = 2;
+    if (mode == 2) return [super prepare];
+    if (mode == 1) { [self alert:@"Startup validation failed."]; return NO; }
+    return YES;
+}
+- (void)alert:(NSString *)message
+{
+    assert(phase == 2);
+    if (mode == 2) assert([message isEqualToString:@"Setup must be run as root."]);
+    phase = 3;
+}
+- (void)showPackages { assert(mode == 0 && phase == 2); phase = 4; }
+- (void)terminate:(id)sender
+{
+    assert(mode != 0 && phase == 3);
+    assert([self applicationShouldTerminate:nil]);
+    phase = 4;
+}
+- (int)phase { return phase; }
+@end
+
+static void testStartup(void)
+{
+    id savedApp = NSApp;
+    int mode;
+    for (mode = 0; mode < (geteuid() == 0 ? 2 : 3); ++mode) {
+        StartupProbe *probe = [[StartupProbe alloc] initWithMode:mode];
+        NSApp = probe;
+        [probe applicationDidFinishLaunching:nil];
+        assert([probe phase] == 1);
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+        assert([probe phase] == 4);
+        NSApp = savedApp;
+        [probe release];
+    }
+}
 
 /* Stand in for both the app and task to check the focus handoff without a GUI. */
 @interface LaunchProbe : NSObject
@@ -397,6 +475,8 @@ int main(int argc, char **argv)
         return 0;
     }
     pool = [[NSAutoreleasePool alloc] init];
+    testBundle();
+    testStartup();
     testFocusHandoff();
     testReceiptLocations();
     testPackageDescriptions();

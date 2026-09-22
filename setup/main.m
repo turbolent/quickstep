@@ -174,6 +174,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 @interface SetupController : NSObject
 {
     NSWindow *window;
+    NSScrollView *packageScroll;
     NSTextField *status;
     NSButton *installButton, *quitButton;
     NSMutableArray *rows, *visibleChoices, *pending;
@@ -190,6 +191,10 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 }
 - (BOOL)prepare;
 - (void)show;
+- (void)showPackages;
+- (void)finishStartup;
+- (void)alert:(NSString *)message;
+- (void)applicationDidFinishLaunching:(NSNotification *)notification;
 - (NSDictionary *)matchingReceipt:(NSString *)name;
 - (void)advance;
 - (void)selectionChanged:(id)sender;
@@ -204,6 +209,17 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 @end
 
 @implementation SetupController
+- (void)applicationDidFinishLaunching:(NSNotification *)notification
+{
+    [self show];
+    /* Let the window appear before validation opens a modal alert. */
+    [self performSelector:@selector(finishStartup) withObject:nil afterDelay:0];
+}
+- (void)finishStartup
+{
+    if (![self prepare]) { [NSApp terminate:self]; return; }
+    [self showPackages];
+}
 - (void)message:(NSString *)message
 {
     [status setStringValue:message];
@@ -357,13 +373,8 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
 }
 - (void)show
 {
-    int i;
-    float height = 0, y;
     unsigned int style = NSTitledWindowMask | NSClosableWindowMask | NSMiniaturizableWindowMask | NSResizableWindowMask;
     NSRect minimum = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, 400, 320) styleMask:style];
-    NSString *category = nil;
-    NSScrollView *scroll;
-    NSView *content;
     NSTextField *instructions;
     window = [[NSWindow alloc] initWithContentRect:NSMakeRect(80, 60, 460, 430)
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
@@ -374,18 +385,40 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
     instructions = [self label:@"Select additional software to install.\nComplete each installation, then quit Installer; Setup opens the next package automatically."
                frame:NSMakeRect(14, 362, 432, 54) bold:NO in:[window contentView]];
     [instructions setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+    packageScroll = [[[NSScrollView alloc] initWithFrame:NSMakeRect(14, 110, 432, 245)] autorelease];
+    [packageScroll setBorderType:NSBezelBorder];
+    [packageScroll setHasVerticalScroller:YES];
+    [packageScroll setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [[window contentView] addSubview:packageScroll];
+    status = [self label:@"Starting..." frame:NSMakeRect(14, 57, 432, 44) bold:NO in:[window contentView]];
+    [status setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
+    quitButton = [[NSButton alloc] initWithFrame:NSMakeRect(244, 15, 94, 28)];
+    [quitButton setAutoresizingMask:NSViewMinXMargin | NSViewMaxYMargin];
+    [quitButton setTitle:@"Quit"]; [quitButton setTarget:self]; [quitButton setAction:@selector(quit:)];
+    [[window contentView] addSubview:quitButton];
+    installButton = [[NSButton alloc] initWithFrame:NSMakeRect(342, 15, 104, 28)];
+    [installButton setAutoresizingMask:NSViewMinXMargin | NSViewMaxYMargin];
+    [installButton setTitle:@"Install"]; [installButton setTarget:self]; [installButton setAction:@selector(install:)];
+    [installButton setEnabled:NO];
+    [[window contentView] addSubview:installButton];
+    [window center]; [window makeKeyAndOrderFront:self];
+    [NSApp activateIgnoringOtherApps:YES];
+    [window display]; [[NSApp context] flush];
+}
+- (void)showPackages
+{
+    int i;
+    float height = 0, y;
+    NSString *category = nil;
+    NSView *content;
     for (i = 0; i < [visibleChoices count]; ++i) {
         NSString *next = [[visibleChoices objectAtIndex:i] objectForKey:@"Category"];
         height += [next isEqualToString:category] ? 22 : 44;
         category = next;
     }
     y = 2; category = nil;
-    scroll = [[[NSScrollView alloc] initWithFrame:NSMakeRect(14, 110, 432, 245)] autorelease];
-    [scroll setBorderType:NSBezelBorder];
-    [scroll setHasVerticalScroller:YES];
-    [scroll setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-    height = MAX(height + 2, [scroll contentSize].height);
-    content = [[[PackageListView alloc] initWithFrame:NSMakeRect(0, 0, [scroll contentSize].width, height)] autorelease];
+    height = MAX(height + 2, [packageScroll contentSize].height);
+    content = [[[PackageListView alloc] initWithFrame:NSMakeRect(0, 0, [packageScroll contentSize].width, height)] autorelease];
     [content setAutoresizingMask:NSViewWidthSizable];
     for (i = 0; i < [visibleChoices count]; ++i) {
         NSDictionary *choice = [visibleChoices objectAtIndex:i];
@@ -404,22 +437,10 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         [row setTarget:self]; [row setAction:@selector(selectionChanged:)];
         [content addSubview:row]; [rows addObject:row]; y += 22;
     }
-    [scroll setDocumentView:content]; [[window contentView] addSubview:scroll];
+    [packageScroll setDocumentView:content];
     [content scrollPoint:NSMakePoint(0, 0)];
-    status = [self label:@"" frame:NSMakeRect(14, 57, 432, 44) bold:NO in:[window contentView]];
-    [status setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
-    quitButton = [[NSButton alloc] initWithFrame:NSMakeRect(244, 15, 94, 28)];
-    [quitButton setAutoresizingMask:NSViewMinXMargin | NSViewMaxYMargin];
-    [quitButton setTitle:@"Quit"]; [quitButton setTarget:self]; [quitButton setAction:@selector(quit:)];
-    [[window contentView] addSubview:quitButton];
-    installButton = [[NSButton alloc] initWithFrame:NSMakeRect(342, 15, 104, 28)];
-    [installButton setAutoresizingMask:NSViewMinXMargin | NSViewMaxYMargin];
-    [installButton setTitle:@"Install"]; [installButton setTarget:self]; [installButton setAction:@selector(install:)];
-    [[window contentView] addSubview:installButton];
     [self updateRows];
     [self message:[available count] ? @"Ready. Already-installed packages will be skipped." : @"No supported packages are present on this CD."];
-    [window center]; [window makeKeyAndOrderFront:self];
-    [NSApp activateIgnoringOtherApps:YES];
 }
 - (void)selectionChanged:(id)sender
 {
@@ -679,7 +700,7 @@ int main(int argc, char **argv)
     [NSApplication sharedApplication];
     controller = [[SetupController alloc] init];
     [NSApp setDelegate:controller];
-    if ([controller prepare]) { [controller show]; [NSApp run]; }
+    [NSApp run];
     [NSApp setDelegate:nil]; [controller release]; [pool release];
     return 0;
 }
