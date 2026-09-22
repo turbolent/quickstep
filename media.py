@@ -22,6 +22,8 @@ import tarfile
 import tempfile
 from typing import TypeAlias
 
+from macho import strip_driver_debug
+
 
 ROOT = "/private/Drivers/i386"
 MANIFEST = ".media-metadata"
@@ -31,6 +33,7 @@ __all__ = [
     "check_image", "pad_image", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
     "prepare_installation_drivers", "verify_boot_cd",
     "skip_boot_language_selection",
+    "remove_boot_languages",
     "remove_language_packages", "patch_builddisk_language_heading",
     "SetupPackage", "SetupChoice", "SetupCatalog", "setup_plist",
     "validate_setup_app", "prepare_setup_app", "verify_setup_app",
@@ -478,7 +481,7 @@ def local_tree(source: PathInput) -> list[Entry]:
     return result
 
 
-def _store(image: Image, name: str, source: PathInput) -> None:
+def _store(image: Image, name: str, source: PathInput, *, strip_debug: bool = False) -> None:
     if name == "System":
         raise MediaError("System.config may be configured, but not replaced")
     source = Path(source).absolute()
@@ -498,6 +501,13 @@ def _store(image: Image, name: str, source: PathInput) -> None:
                     # line endings without decoding or modifying the source bundle.
                     data = local.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
                     local = Path(temp) / "table"
+                    local.write_bytes(data)
+                elif strip_debug and entry.name.endswith("_reloc"):
+                    try:
+                        data = strip_driver_debug(local.read_bytes())
+                    except ValueError as exc:
+                        raise MediaError(f"{name}.config/{entry.name}: {exc}") from exc
+                    local = Path(temp) / "driver"
                     local.write_bytes(data)
                 image.mutate("from-file", path, local)
     for entry in reversed(entries):
@@ -580,14 +590,15 @@ class DriverImage:
         with self._operation() as image:
             _extract(image, name, destination)
 
-    def store(self, driver: str, source: PathInput) -> None:
+    def store(self, driver: str, source: PathInput, *, strip_debug: bool = False) -> None:
         """Store a local bundle, normalizing .table line endings to Unix LF.
 
         Preserve source files and metadata; refuse to replace an existing bundle.
+        With strip_debug, remove only STABS from *_reloc binaries before import.
         """
         name = driver_name(driver)
         with self._operation(write=True) as image:
-            _store(image, name, source)
+            _store(image, name, source, strip_debug=strip_debug)
 
     def remove(self, driver: str) -> None:
         """Remove an inactive bundle; System.config is protected."""
@@ -776,7 +787,7 @@ def skip_boot_language_selection(image: PathInput, *, nextufs_binary: PathInput 
     an empty or single-language value would still enter the menu code.
     Keep the file and its other entries, and retain the installation confirmation.
     """
-    with transaction(Image(executable(nextufs_binary), image)) as staged:
+    with transaction(Image(executable(nextufs_binary), image, root="/usr/standalone/i386")) as staged:
         path = "/usr/standalone/i386/Language.table"
         entry = staged.inspect(path)[0]
         original = staged.read(path, entry)
@@ -786,6 +797,26 @@ def skip_boot_language_selection(image: PathInput, *, nextufs_binary: PathInput 
             staged.write(path, table.data(), entry, exists=True)
         if staged.read(path) != table.data():
             raise ValueError("boot language table readback failed")
+
+
+def remove_boot_languages(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Remove the five non-English boot translations from an English-only floppy."""
+    with transaction(Image(executable(nextufs_binary), image, root="/usr/standalone/i386")) as staged:
+        root = "/usr/standalone/i386"
+        table = Table(staged.read(root + "/Language.table"))
+        if any(name == "Languages" for name, *_ in table.entries):
+            raise ValueError("disable boot language selection before removing translations")
+        for language in ("French", "German", "Italian", "Spanish", "Swedish"):
+            name = language + ".lproj"
+            entry = staged.child(root, name)
+            if entry is None:
+                continue
+            if not entry.is_dir:
+                raise ValueError(f"boot translation is not a directory: {name}")
+            path = root + "/" + name
+            for item in reversed(staged.tree(path)):
+                staged.mutate("rmdir" if item.is_dir else "unlink",
+                              path if item.name == "." else path + "/" + item.name)
 
 
 # Complete instruction sequences, including the IRQ7/IRQ15 tests and exit jump.
@@ -896,12 +927,15 @@ if [ "${ARCH}" = "i386" ]; then
         echo "Cannot install boot-floppy drivers; installation stopped."
         exit 1
     fi
-    echo "Configuring installed-system boot drivers..."
+    echo "Configuring installed-system drivers..."
     SYSTEM_CONFIG="${HD}/usr/Devices/System.config"
     if [ -f "${SYSTEM_CONFIG}/Default.table" ]; then
         # Instance tables take precedence over Default.table when present.
-        for TABLE_FILE in "${SYSTEM_CONFIG}/Default.table" "${SYSTEM_CONFIG}"/Instance[0-9]*.table
+        # OPENSTEP sh does not expand globs joined to a quoted path prefix.
+        (cd "${SYSTEM_CONFIG}" || exit 1
+        for TABLE_FILE in Default.table Instance[0-9]*.table
         do
+            TABLE_FILE="${SYSTEM_CONFIG}/${TABLE_FILE}"
             if [ -f "${TABLE_FILE}" ]; then
                 # Use legacy awk syntax: no -v option or ternary expressions.
                 if ${CP} -p "${TABLE_FILE}" "${TABLE_FILE}.quickstep" &&
@@ -909,26 +943,36 @@ if [ "${ARCH}" = "i386" ]; then
                     BEGIN {
                         boot = "@BOOT_DRIVERS@"
                         count = split(boot, drivers, " ")
+                        added = "@ACTIVE_DRIVERS@"
+                        additions = split(added, extra, " ")
+                        value = ""
                     }
                     /^[ \t]*"Boot Drivers"[ \t]*=/ { next }
                     /^[ \t]*"Active Drivers"[ \t]*=/ {
                         split($0, fields, "\"")
                         total = split(fields[4], active, " ")
-                        value = ""
                         for (i = 1; i <= total; i++) {
                             keep = 1
                             for (j = 1; j <= count; j++)
                                 if (active[i] == drivers[j]) keep = 0
+                            for (j = 1; j <= additions; j++)
+                                if (active[i] == extra[j]) keep = 0
                             if (keep) {
                                 if (value == "") value = active[i]
                                 else value = value " " active[i]
                             }
                         }
-                        printf "\"Active Drivers\" = \"%s\";\n", value
                         next
                     }
                     { print }
-                    END { printf "\"Boot Drivers\" = \"%s\";\n", boot }
+                    END {
+                        if (added != "") {
+                            if (value == "") value = added
+                            else value = value " " added
+                        }
+                        printf "\"Active Drivers\" = \"%s\";\n", value
+                        printf "\"Boot Drivers\" = \"%s\";\n", boot
+                    }
                     ' "${TABLE_FILE}" > "${TABLE_FILE}.quickstep" &&
                     ${MV} "${TABLE_FILE}.quickstep" "${TABLE_FILE}"; then
                     echo "Configured boot drivers in ${TABLE_FILE}."
@@ -938,6 +982,7 @@ if [ "${ARCH}" = "i386" ]; then
                 fi
             fi
         done
+        ) || exit 1
     else
         echo "Missing installed System.config/Default.table; installation stopped."
         exit 1
@@ -963,13 +1008,17 @@ _INSTALL_PIC_HOOK = br'''    echo "Installing PIC-patched kernel on the startup 
 
 
 def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_bug: bool = False,
-                        package_hook: bytes = b"") -> bytes:
+                        package_hook: bytes = b"", active_drivers: Iterable[str] = ()) -> bytes:
     """Install drivers and optionally a patched kernel/helper before final reboot."""
     names = list(boot_drivers)
+    active = list(active_drivers)
     # These names are embedded in both a shell argument and an OPENSTEP table.
-    if not names or any(re.fullmatch(r"[A-Za-z0-9_.+-]+", name) is None for name in names):
+    if not names or any(re.fullmatch(r"[A-Za-z0-9_.+-]+", name) is None for name in names + active):
         raise ValueError("expected a nonempty list of safe boot-driver names")
+    if len(set(names + active)) != len(names + active):
+        raise ValueError("duplicate installation driver names")
     hook = _INSTALL_DRIVER_HOOK.replace(b"@BOOT_DRIVERS@", " ".join(names).encode("ascii"))
+    hook = hook.replace(b"@ACTIVE_DRIVERS@", " ".join(active).encode("ascii"))
     hook = hook.replace(b"@PIC_HOOK@", _INSTALL_PIC_HOOK if fix_pic_bug else b"")
     hook = hook.replace(b"@PACKAGE_HOOK@", package_hook)
     if script.count(_INSTALL_DRIVER_ANCHOR) != 1:
@@ -1034,6 +1083,8 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     it after base-system copying/configuration, before reboot. Keep the installer's
     generated System.config and language settings, but replace its Boot Drivers
     with the floppy's ordered list and remove those names from Active Drivers.
+    Merge packaged active drivers in their floppy order, retaining other active
+    drivers and removing duplicates of the added names.
     Update Default.table and any instance tables; do not copy CD-boot settings.
     With fix_pic_bug, derive the installed kernel from the User CD, not the boot
     floppy. Stage a thin, patched copy for rc.cdrom to install after ditto's
@@ -1043,13 +1094,16 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     Run package_hook before copying driver configurations. For packaged_drivers,
     stage only Instance0.table; their complete bundles come from package_hook.
     """
+    packaged_drivers = tuple(packaged_drivers)
     with new_output(output, source=user_ufs) as staged:
         image = Image(executable(nextufs_binary), staged)
         path = "/etc/rc.cdrom"
         entry = image.inspect(path)[0]
         _, system = system_table(Image(executable(nextufs_binary), boot))
-        script = _patch_cd_installer(image.read(path, entry), driver_lists(system)[0],
-                                     fix_pic_bug=fix_pic_bug, package_hook=package_hook)
+        boot_names, active_names = driver_lists(system)
+        script = _patch_cd_installer(image.read(path, entry), boot_names,
+                                     fix_pic_bug=fix_pic_bug, package_hook=package_hook,
+                                     active_drivers=(name for name in active_names if name in packaged_drivers))
         archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers)
         for payload in (_INSTALL_DRIVER_ARCHIVE, _INSTALL_KERNEL, _INSTALL_PIC_SCRIPT):
             if image.child("/NextCD", payload.rsplit("/", 1)[1]) is not None:
@@ -1830,6 +1884,7 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     of requiring the embedded User UFS to be byte-identical to the original CD.
     """
     boot_disk, boot, user_cd, ufs, iso = map(Path, (boot_disk, boot, user_cd, ufs, iso))
+    packaged_drivers = tuple(packaged_drivers)
     with boot_disk.open("rb") as source, boot.open("rb") as prepared:
         original, grown = source.read(65536), prepared.read(65536)
     if len(original) != 65536 or boot.stat().st_size != MAX_BOOT_FLOPPY_KIB * 1024:
@@ -1846,8 +1901,10 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     original_script = nextufs("browse", "--raw", user_cd, "/etc/rc.cdrom", binary=nextufs_binary)
     if installation_drivers:
         _, system = system_table(Image(executable(nextufs_binary), boot))
-        expected_script = _patch_cd_installer(original_script, driver_lists(system)[0],
-                                              fix_pic_bug=fix_pic_bug, package_hook=package_hook)
+        boot_names, active_names = driver_lists(system)
+        expected_script = _patch_cd_installer(original_script, boot_names,
+                                              fix_pic_bug=fix_pic_bug, package_hook=package_hook,
+                                              active_drivers=(name for name in active_names if name in packaged_drivers))
         archive = nextufs("browse", "--raw", iso, _INSTALL_DRIVER_ARCHIVE, binary=nextufs_binary)
         if archive != _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers):
             raise ValueError("installation drivers differ from the boot floppy")

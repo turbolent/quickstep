@@ -19,7 +19,8 @@ import bom
 import media
 
 
-__all__ = ["PackageInfo", "prepare_package", "InstalledPackage", "install_package", "installation_hook"]
+__all__ = ["PackageInfo", "prepare_package", "InstalledPackage", "install_package", "installation_hook",
+           "InstalledDriver", "install_driver_package"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,38 @@ class InstalledPackage:
     @property
     def receipt(self) -> str:
         return "/NextLibrary/Receipts/" + self.name + ".pkg"
+
+
+@dataclass(frozen=True)
+class InstalledDriver:
+    name: str
+    package: InstalledPackage
+
+
+def install_driver_package(package: media.PathInput, target_ufs: media.PathInput,
+                           output: media.PathInput, *,
+                           nextufs_binary: media.PathInput | None = None) -> InstalledDriver:
+    """Install a package containing one driver bundle directly in /private/Devices.
+
+    Keep the original payload and receipt intact; configuration and activation
+    are separate operations. Reject unsupported driver layouts before publication.
+    """
+    with media.new_output(output) as staged:
+        installed = install_package(package, target_ufs, staged, nextufs_binary=nextufs_binary)
+        bundles = [path for path in installed.paths if path.endswith(".config")]
+        if (installed.location != "/private/Devices" or len(bundles) != 1 or
+                bundles[0].rsplit("/", 1)[0] != installed.location):
+            raise ValueError(f"installation driver package must install exactly one .config bundle "
+                             f"directly in /private/Devices: {package}")
+        name = media.driver_name(bundles[0].rsplit("/", 1)[1])
+        if name == "System" or re.fullmatch(r"[A-Za-z0-9_.+-]+", name) is None:
+            raise ValueError(f"unsupported installation driver name: {name}")
+        image = media.Image(media.executable(nextufs_binary), staged)
+        if not image.inspect(bundles[0])[0].is_dir:
+            raise ValueError(f"installation driver bundle is not a directory: {bundles[0]}")
+        # Every bundle needs its default even if it already has an instance.
+        media.Table(image.read(bundles[0] + "/Default.table"))
+    return InstalledDriver(name, installed)
 
 
 def installation_hook(packages: Iterable[InstalledPackage]) -> bytes:

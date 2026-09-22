@@ -36,7 +36,18 @@ python3 build_cd.py \
 
 ### Optional flags
 
-- **Recommended** `--bus-master-ide /path/to/BusMasterIDE.config`: use an extracted BusMasterIDE bundle instead of EIDE; `--beta-disk` is then unnecessary.
+- **Recommended** `--bus-master-ide /path/to/BusMasterIDE.pkg`: install BusMasterIDE instead of EIDE; `--beta-disk` is then unnecessary.
+  Accepts a `.pkg` directory or a single-package tar archive, not an extracted `.config` bundle.
+- `--installation-driver /path/to/Driver.pkg`: install a driver on the boot floppy, CD filesystem, and startup disk automatically.
+  Repeat the flag for additional drivers; single-package tar archives are also accepted.
+  Each package must be script-free and install one `.config` bundle directly in `/private/Devices`.
+  Driver activation follows `Instance0.table` (created from `Default.table` if missing), including its `Boot Driver` setting.
+  Added drivers retain their command-line order within each activation list.
+  The installed system receives each complete package and receipt, plus the configured instance from the boot floppy.
+  This also applies to `--bus-master-ide`; its only special behavior is replacing EIDE.
+  These drivers are installed during system installation, not offered as optional Setup choices, and must fit on the boot floppy.
+  Debug symbols are stripped automatically from boot-floppy driver binaries;
+  the original packages and the payloads installed on the CD and startup disk remain unchanged.
 - `--developer-cd /path/to/Developer.iso`: include the Developer CD packages.
 - `--user-patch /path/to/OS42MachUserPatch4.tar`: include User Patch 4.
 - `--developer-patch /path/to/OS42MachDevPatch4.tar`: include Developer Patch 4.
@@ -50,7 +61,7 @@ python3 build_cd.py \
   Selecting it installs User Patch 4 first if needed, then FramebufferWC, patches VBE, and activates both drivers in load order.
   Missing driver instances are copied from their default tables; existing instance settings are preserved.
   Reboot afterward to use the drivers.
-- `--remove-language-packages`: remove additional language packages and their receipt entries from the generated CD.
+- `--remove-languages`: remove non-English boot-floppy translations and additional language packages and their receipt entries from the generated CD.
   English and existing localized files in the base system are retained.
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.
 - `--nextufs /path/to/nextufs`: select the nextufs executable explicitly.

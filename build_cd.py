@@ -41,26 +41,44 @@ SETUP_CATALOG = media.SetupCatalog(
 
 def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInput | None,
                     stage: Path, *, nextufs_binary: PathInput | None = None,
-                    bus_master_ide_bundle: PathInput | None = None) -> None:
+                    installation_driver_bundles: Sequence[PathInput] = (),
+                    use_bus_master_ide: bool = False) -> None:
     """Prepare the boot drivers through the root media.py library only."""
-    if bus_master_ide_bundle is not None and not Path(bus_master_ide_bundle).is_dir():
-        raise NotADirectoryError(f"BusMasterIDE bundle must be a directory: {bus_master_ide_bundle}")
+    bundles: dict[str, Path] = {}
+    for bundle in map(Path, installation_driver_bundles):
+        if not bundle.is_dir() or not bundle.name.endswith(".config"):
+            raise ValueError(f"installation driver must be a .config directory: {bundle}")
+        name = media.driver_name(bundle.name)
+        if name in bundles or name == "System":
+            raise ValueError(f"duplicate or reserved installation driver: {name}")
+        bundles[name] = bundle
+    if use_bus_master_ide and "BusMasterIDE" not in bundles:
+        raise ValueError("BusMasterIDE replacement bundle is missing")
+    if use_bus_master_ide and "EIDE" in bundles:
+        raise ValueError("an EIDE installation driver conflicts with --bus-master-ide")
     target = media.DriverImage(image, nextufs=nextufs_binary)
-    boot_drivers = tuple("BusMasterIDE" if name == "EIDE" and bus_master_ide_bundle is not None else name
+    boot_drivers = tuple("BusMasterIDE" if name == "EIDE" and use_bus_master_ide else name
                          for name in BOOT_DRIVERS)
-    if bus_master_ide_bundle is not None:
-        print(f"Using packaged BusMasterIDE from {bus_master_ide_bundle} as a boot driver instead of EIDE...", flush=True)
+    if use_bus_master_ide:
+        print("Using packaged BusMasterIDE instead of EIDE...", flush=True)
         print("Deactivating EIDE...", flush=True)
         target.deactivate("EIDE")
         print("Checking for an existing EIDE bundle...", flush=True)
         if "EIDE" in target.list_drivers():
             print("Removing the existing EIDE bundle...", flush=True)
             target.remove("EIDE")
+    elif "EIDE" in bundles:
+        print("Using packaged EIDE...", flush=True)
     else:
         print(f"Using EIDE with the PIIX configuration from {beta_disk}...", flush=True)
-    for name in boot_drivers:
-        if name == "BusMasterIDE" and bus_master_ide_bundle is not None:
-            local = Path(bus_master_ide_bundle)
+    extra_drivers = tuple(name for name in bundles if name not in boot_drivers)
+    for name in boot_drivers + extra_drivers:
+        if name in bundles:
+            local = bundles[name]
+            print(f"Replacing any existing {name} bundle...", flush=True)
+            target.deactivate(name)
+            if name in target.list_drivers():
+                target.remove(name)
         else:
             source_disk = beta_disk if name == "EIDE" else driver_disk
             if source_disk is None:
@@ -69,13 +87,11 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
             local = stage / (name + ".config")
             print(f"Extracting {name} from {source_disk}...", flush=True)
             source.extract(name, local)
-        print(f"Storing {name} on the boot floppy...", flush=True)
-        target.store(name, local)
+        print(f"Stripping debug symbols and storing {name} on the boot floppy...", flush=True)
+        target.store(name, local, strip_debug=True)
         print(f"Configuring {name}...", flush=True)
-        if name == "EIDE":
+        if name == "EIDE" and name not in bundles:
             target.configure(name, source_table="EIDE_PIIX.table", overwrite=True)
-        elif name == "BusMasterIDE":
-            target.configure(name, settings={"Boot Driver": "Yes"})
         else:
             target.configure(name)
     # The stock instance lists these drivers, but this boot image does not use them.
@@ -86,6 +102,9 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
         # Reproduce the tested load order, not a hardware dependency graph.
         print(f"Activating {name}...", flush=True)
         target.activate(name, dependencies=(boot_drivers[index - 1],) if index else ())
+    for name in extra_drivers:
+        print(f"Activating {name} according to its instance table...", flush=True)
+        target.activate(name)
     print("Configuring boot-floppy System settings...", flush=True)
     target.configure("System", settings={
         "Ask For Drivers": "No",
@@ -98,16 +117,21 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
 
 def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | None,
             output: PathInput, *, nextufs_binary: PathInput | None = None,
-            bus_master_ide_bundle: PathInput | None = None) -> None:
+            installation_driver_bundles: Sequence[PathInput] = (),
+            use_bus_master_ide: bool = False, remove_languages: bool = False) -> None:
     """Make a grown, driver-equipped copy; publish only after every step succeeds."""
     print(f"Copying boot floppy from {boot_disk}...", flush=True)
     with media.new_output(output, source=boot_disk) as image:
         print(f"Growing boot-floppy UFS to {media.MAX_GROWN_FLOPPY_KIB} KiB...", flush=True)
         media.grow_image(image, media.MAX_GROWN_FLOPPY_KIB, nextufs_binary=nextufs_binary)
-        install_drivers(image, driver_disk, beta_disk, image.parent, nextufs_binary=nextufs_binary,
-                        bus_master_ide_bundle=bus_master_ide_bundle)
         print("Disabling boot-floppy language selection...", flush=True)
         media.skip_boot_language_selection(image, nextufs_binary=nextufs_binary)
+        if remove_languages:
+            print("Removing non-English boot-floppy translations...", flush=True)
+            media.remove_boot_languages(image, nextufs_binary=nextufs_binary)
+        install_drivers(image, driver_disk, beta_disk, image.parent, nextufs_binary=nextufs_binary,
+                        installation_driver_bundles=installation_driver_bundles,
+                        use_bus_master_ide=use_bus_master_ide)
         print("Checking boot-floppy filesystem (fsck)...", flush=True)
         media.check_image(image, nextufs_binary=nextufs_binary)
         print(f"Padding boot floppy to {media.MAX_BOOT_FLOPPY_KIB} KiB...", flush=True)
@@ -119,9 +143,10 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           nextufs_binary: PathInput | None = None, bus_master_ide: PathInput | None = None,
           fix_pic_bug: bool = False, developer_cd: PathInput | None = None,
           user_patch: PathInput | None = None, developer_patch: PathInput | None = None,
-          remove_language_packages: bool = False, setup_app: PathInput | None = None,
+          remove_languages: bool = False, setup_app: PathInput | None = None,
           profile_libs_patch: PathInput | None = None,
-          driver_packages: Sequence[PathInput] = (), framebuffer_wc: PathInput | None = None) -> None:
+          driver_packages: Sequence[PathInput] = (), framebuffer_wc: PathInput | None = None,
+          installation_drivers: Sequence[PathInput] = ()) -> None:
     """Build and check the complete ISO; keep intermediates only until publication."""
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
@@ -132,10 +157,11 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                         ("Developer patch", developer_patch), ("Profiling libraries patch", profile_libs_patch)):
         if path is not None and not Path(path).is_file():
             raise ValueError(f"{label} must be a regular file: {path}")
-    if bus_master_ide is not None:
-        package_path = Path(bus_master_ide)
+    required_drivers = ([bus_master_ide] if bus_master_ide is not None else []) + list(installation_drivers)
+    for path in required_drivers:
+        package_path = Path(path)
         if not (package_path.is_file() or (package_path.is_dir() and package_path.name.endswith(".pkg"))):
-            raise ValueError(f"BusMasterIDE must be a .pkg directory or package archive: {bus_master_ide}")
+            raise ValueError(f"installation driver must be a .pkg directory or package archive: {path}")
     if setup_app is not None:
         media.validate_setup_app(setup_app)
         media.setup_plist(SETUP_CATALOG, fix_pic_bug=fix_pic_bug)
@@ -179,36 +205,39 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         boot = iso.parent / "boot.img"
         ufs = iso.parent / "user.ufs"
         installer = iso.parent / "installer.ufs"
-        bus_master_ide_bundle = None
-        package_hook = b""
-        packaged_drivers = ()
-        if bus_master_ide is not None:
+        installed_drivers: list[pkg.InstalledDriver] = []
+        driver_bundles: list[Path] = []
+        if required_drivers:
             print(f"Extracting User CD filesystem from {user_cd}...", flush=True)
             media.extract_ufs(user_cd, ufs, nextufs_binary=nextufs_binary)
-            packaged = iso.parent / "bus-master-ide.ufs"
-            print(f"Installing BusMasterIDE package from {bus_master_ide}...", flush=True)
-            installed = pkg.install_package(bus_master_ide, ufs, packaged, nextufs_binary=nextufs_binary)
-            bundles = [path for path in installed.paths if path.endswith("/BusMasterIDE.config")]
-            if len(bundles) != 1:
-                raise ValueError("BusMasterIDE package must install exactly one BusMasterIDE.config bundle")
-            # The boot loader searches /private/Drivers/i386; the full package
-            # stays at its native location on the CD and installed system.
-            driver_root = bundles[0].rsplit("/", 1)[0] or "/"
-            if installed.location != "/private/Devices" or driver_root != installed.location:
-                raise ValueError("BusMasterIDE package must install its driver in /private/Devices")
-            bus_master_ide_bundle = iso.parent / "BusMasterIDE.config"
-            media.DriverImage(packaged, nextufs=nextufs_binary, driver_root=driver_root).extract(
-                "BusMasterIDE", bus_master_ide_bundle)
-            package_hook = pkg.installation_hook((installed,))
-            packaged_drivers = ("BusMasterIDE",)
+        for index, path in enumerate(required_drivers):
+            packaged = iso.parent / f"installation-driver-{index}.ufs"
+            print(f"Installing driver package from {path} on the CD...", flush=True)
+            installed = pkg.install_driver_package(path, ufs, packaged, nextufs_binary=nextufs_binary)
+            if index == 0 and bus_master_ide is not None and installed.name != "BusMasterIDE":
+                raise ValueError("--bus-master-ide requires a package containing BusMasterIDE.config")
+            if any(item.name == installed.name or item.package.name == installed.package.name
+                   for item in installed_drivers):
+                raise ValueError(f"duplicate installation driver or package: {installed.name}")
+            if bus_master_ide is not None and installed.name == "EIDE":
+                raise ValueError("an EIDE installation driver conflicts with --bus-master-ide")
+            bundle = iso.parent / (installed.name + ".config")
+            print(f"Extracting {installed.name} for the boot floppy...", flush=True)
+            media.DriverImage(packaged, nextufs=nextufs_binary, driver_root=installed.package.location).extract(
+                installed.name, bundle)
+            installed_drivers.append(installed)
+            driver_bundles.append(bundle)
             ufs = packaged
+        package_hook = pkg.installation_hook(item.package for item in installed_drivers)
+        packaged_drivers = tuple(item.name for item in installed_drivers)
         print(f"Preparing boot floppy and drivers from {boot_disk}...", flush=True)
         drivers(boot_disk, driver_disk, beta_disk, boot, nextufs_binary=nextufs_binary,
-                bus_master_ide_bundle=bus_master_ide_bundle)
-        if bus_master_ide is None:
+                installation_driver_bundles=driver_bundles, use_bus_master_ide=bus_master_ide is not None,
+                remove_languages=remove_languages)
+        if not required_drivers:
             print(f"Extracting User CD filesystem from {user_cd}...", flush=True)
             media.extract_ufs(user_cd, ufs, nextufs_binary=nextufs_binary)
-        if remove_language_packages:
+        if remove_languages:
             print("Removing optional non-English language packages and receipts...", flush=True)
             pruned = iso.parent / "english.ufs"
             media.remove_language_packages(ufs, pruned, nextufs_binary=nextufs_binary)
@@ -295,12 +324,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="FramebufferWC package to include in Setup; requires User Patch 4 and patches VBE after installation")
     parser.add_argument("--fix-pic-bug", action="store_true",
                         help="apply the PIC interrupt fix to the boot and installed kernels")
-    parser.add_argument("--remove-language-packages", action="store_true",
-                        help="omit French, German, Italian, Spanish and Swedish Essentials packages and receipts")
+    parser.add_argument("--remove-languages", action="store_true",
+                        help="omit non-English boot translations and French, German, Italian, Spanish and Swedish Essentials packages and receipts")
     parser.add_argument("--beta-disk", type=Path,
                         help="beta-driver floppy (required unless --bus-master-ide is provided)")
     parser.add_argument("--bus-master-ide", type=Path, metavar="PACKAGE",
                         help="BusMasterIDE .pkg directory or package archive to install instead of EIDE")
+    parser.add_argument("--installation-driver", type=Path, action="append", default=[], metavar="PACKAGE",
+                        help="driver .pkg directory or package archive to install on the boot floppy, CD and startup disk (repeatable)")
     args = parser.parse_args(argv)
     if args.beta_disk is None and args.bus_master_ide is None:
         parser.error("--beta-disk is required unless --bus-master-ide is provided")
@@ -309,9 +340,9 @@ def main(argv: Sequence[str] | None = None) -> int:
               user_cd=args.user_cd, output=args.output, iso_tool=args.iso_tool, nextufs_binary=args.nextufs,
               bus_master_ide=args.bus_master_ide, fix_pic_bug=args.fix_pic_bug, developer_cd=args.developer_cd,
               user_patch=args.user_patch, developer_patch=args.developer_patch,
-              remove_language_packages=args.remove_language_packages, setup_app=args.setup_app,
+              remove_languages=args.remove_languages, setup_app=args.setup_app,
               profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package,
-              framebuffer_wc=args.framebuffer_wc)
+              framebuffer_wc=args.framebuffer_wc, installation_drivers=args.installation_driver)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"build_cd.py: {exc}\n")
     return 0
