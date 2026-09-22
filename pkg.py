@@ -6,6 +6,7 @@ See docs/installer.md for supported package formats and offline limits.
 
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+import hashlib
 import io
 from pathlib import Path, PureWindowsPath
 import re
@@ -20,7 +21,8 @@ import media
 
 
 __all__ = ["PackageInfo", "prepare_package", "InstalledPackage", "install_package", "installation_hook",
-           "InstalledDriver", "install_driver_package"]
+           "InstalledDriver", "install_driver_package", "PreparedUserPatch", "prepare_user_patch",
+           "user_patch_installation_hook"]
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,52 @@ class InstalledPackage:
 class InstalledDriver:
     name: str
     package: InstalledPackage
+
+
+@dataclass(frozen=True)
+class PreparedUserPatch:
+    package: InstalledPackage
+    receipt_source: str
+
+
+_USER_PATCH = "OS42MachUserPatch4"
+# The original hook only runs disk -b on the i386 root device. We implement
+# that action against rc.cdrom's selected disk, never against the build host.
+_USER_PATCH_POST_SHA256 = "ecac37f4f2799e006ffe7fb14f13dfd8c88f8f326164b06ec29461d8a4aea89e"
+
+
+def prepare_user_patch(package: media.PathInput, target_ufs: media.PathInput,
+                       output: media.PathInput, *,
+                       nextufs_binary: media.PathInput | None = None) -> PreparedUserPatch:
+    """Overlay User Patch 4 and stage its receipt outside BuildDisk's inventory.
+
+    Only the known bootloader hook is accepted. The destination disk's boot
+    area is updated later by user_patch_installation_hook(), before its receipt
+    is published. The CD's embedded floppy bootloader is intentionally unchanged.
+    """
+    name, files = _package_bundle(package)
+    script = files.get(name + ".post_install")
+    info = files.get(name + ".info")
+    hooks = {path for path in files if path.endswith((".pre_install", ".post_install"))}
+    if (name != _USER_PATCH or info is None or not stat.S_ISREG(info.entry.mode) or
+            script is None or not stat.S_ISREG(script.entry.mode) or
+            hooks != {name + ".post_install"} or
+            hashlib.sha256(script.data).hexdigest() != _USER_PATCH_POST_SHA256):
+        raise ValueError("expected User Patch 4 with its original bootloader post-install script")
+    fields = _package_fields(info.data)
+    if (fields.get("version", "").strip() != "OPENSTEP Release 4.2 Patch 4" or
+            fields.get("defaultlocation") != "/" or fields.get("relocatable", "NO").upper() != "NO"):
+        raise ValueError("unexpected User Patch 4 version or installation location")
+    del files[name + ".post_install"]
+    receipt = "/NextCD/Receipts/" + name + ".pkg"
+    with media.new_output(output) as staged:
+        installed = _install_package(name, files, target_ufs, staged, location=None, languages=(),
+                                     nextufs_binary=nextufs_binary, receipt_root="/NextCD/Receipts")
+        image = media.Image(media.executable(nextufs_binary), staged)
+        kernel = media._i386_kernel(image.read("/mach_kernel"))
+        if b"mk-183.34.4" not in kernel or not image.read("/usr/standalone/i386/boot"):
+            raise ValueError("User Patch 4 kernel or bootloader is missing or unrecognized")
+    return PreparedUserPatch(installed, receipt)
 
 
 def install_driver_package(package: media.PathInput, target_ufs: media.PathInput,
@@ -82,32 +130,43 @@ def installation_hook(packages: Iterable[InstalledPackage]) -> bytes:
     Use its ROOT, HD, DITTO, MKDIRS, RM and MV variables. Retain all architectures
     and stage each receipt until both payload and receipt copying succeed.
     """
-    commands = []
-    for package in packages:
-        media.component(package.name)
-        location = _package_path(package.location, absolute=True)
-        if not location.startswith("/") or any(
-                path != location and not path.startswith(location.rstrip("/") + "/")
-                for path in package.paths):
-            raise ValueError("CD package payload must be relative to its installation location")
-        receipt = package.receipt
-        temporary = "/NextLibrary/Receipts/." + package.name + ".pkg.quickstep"
-        # Stock rc.cdrom makes /private/Devices a relative symlink to
-        # Drivers/i386. Explicit directory traversal preserves that alias.
-        directory = location.rstrip("/") + "/."
+    return b"".join(_installation_hook(package, package.receipt) for package in packages)
 
-        def source(path: str) -> str:
-            return '"${ROOT}"' + shlex.quote(path)
 
-        def target(path: str) -> str:
-            return '"${HD}"' + shlex.quote(path)
+def user_patch_installation_hook(patch: PreparedUserPatch) -> bytes:
+    """Copy Patch 4, install its hard-disk booter, then publish its receipt."""
+    if patch.package.name != _USER_PATCH or patch.package.location != "/":
+        raise ValueError("expected a prepared User Patch 4 package")
+    return _installation_hook(patch.package, patch.receipt_source, bootloader=True)
 
-        commands.append(f'''    echo {shlex.quote("Installing required package " + package.name + "...")}
+
+def _installation_hook(package: InstalledPackage, receipt_source: str, *, bootloader: bool = False) -> bytes:
+    media.component(package.name)
+    location = _package_path(package.location, absolute=True)
+    receipt_source = _package_path(receipt_source, absolute=True)
+    if not location.startswith("/") or not receipt_source.startswith("/") or any(
+            path != location and not path.startswith(location.rstrip("/") + "/")
+            for path in package.paths):
+        raise ValueError("CD package payload must be relative to its installation location")
+    receipt = package.receipt
+    temporary = "/NextLibrary/Receipts/." + package.name + ".pkg.quickstep"
+    # Explicit traversal preserves rc.cdrom's /private/Devices symlink.
+    directory = location.rstrip("/") + "/."
+
+    def source(path: str) -> str:
+        return '"${ROOT}"' + shlex.quote(path)
+
+    def target(path: str) -> str:
+        return '"${HD}"' + shlex.quote(path)
+
+    finalizer = ('        echo "Installing Patch 4 bootloader on ${rawdisk}..." &&\n'
+                 '        ${DISK} -b "${rawdisk}" &&\n') if bootloader else ""
+    return f'''    echo {shlex.quote("Installing required package " + package.name + "...")}
     if ${{MKDIRS}} {target(location)} &&
-        ${{DITTO}} -bom {source(receipt + "/" + package.name + ".bom")} {source(directory)} {target(directory)} &&
-        ${{MKDIRS}} {target("/NextLibrary/Receipts")} &&
+        ${{DITTO}} -bom {source(receipt_source + "/" + package.name + ".bom")} {source(directory)} {target(directory)} &&
+{finalizer}        ${{MKDIRS}} {target("/NextLibrary/Receipts")} &&
         ${{RM}} -rf {target(temporary)} &&
-        ${{DITTO}} {source(receipt)} {target(temporary)} &&
+        ${{DITTO}} {source(receipt_source)} {target(temporary)} &&
         ${{RM}} -rf {target(receipt)} &&
         ${{MV}} {target(temporary)} {target(receipt)}; then
         echo {shlex.quote("Installed package " + package.name + " and its receipt.")}
@@ -115,8 +174,7 @@ def installation_hook(packages: Iterable[InstalledPackage]) -> bytes:
         echo {shlex.quote("Cannot install required package " + package.name + "; installation stopped.")}
         exit 1
     fi
-''')
-    return "".join(commands).encode("utf-8")
+'''.encode("utf-8")
 
 
 def _uncompress(data: bytes) -> bytes:
@@ -172,6 +230,14 @@ def _uncompress(data: bytes) -> bytes:
 
 class _BigTarInfo(tarfile.TarInfo):
     """NeXT's -B archive has 225-byte name/link fields, not POSIX ustar."""
+
+    @classmethod
+    def fromtarfile(cls, archive: tarfile.TarFile) -> tarfile.TarInfo:
+        # Newer tarfile versions bypass frombuf() in the default reader.
+        # Route every header through our NeXT checksum and field conversion.
+        item = cls.frombuf(archive.fileobj.read(512), archive.encoding, archive.errors)
+        item.offset = archive.fileobj.tell() - 512
+        return item._proc_member(archive)
 
     @classmethod
     def frombuf(cls, buf: bytes, encoding: str, errors: str) -> tarfile.TarInfo:
@@ -428,6 +494,14 @@ def install_package(package: media.PathInput, target_ufs: media.PathInput, outpu
     for relative in files:
         if relative.endswith((".pre_install", ".post_install")):
             raise ValueError(f"offline installation rejects install scripts: {name}.pkg/{relative}")
+    return _install_package(name, files, target_ufs, output, location=location, languages=languages,
+                            nextufs_binary=nextufs_binary)
+
+
+def _install_package(name: str, files: dict[str, _PackageFile], target_ufs: media.PathInput,
+                     output: media.PathInput, *, location: str | None, languages: Iterable[str],
+                     nextufs_binary: media.PathInput | None,
+                     receipt_root: str = "/NextLibrary/Receipts") -> InstalledPackage:
     language_dirs = [media.component(language) + ".lproj" for language in languages]
 
     def resource(extension: str, *, localized: bool = False) -> _PackageFile:
@@ -470,7 +544,7 @@ def install_package(package: media.PathInput, target_ufs: media.PathInput, outpu
     if int(sizes["numfiles"]) != len(payload):
         raise ValueError("package NumFiles differs from BOM/archive inventory")
 
-    receipt = "/NextLibrary/Receipts/" + name + ".pkg"
+    receipt = receipt_root + "/" + name + ".pkg"
     planned: dict[str, _PackageFile] = {}
     now = int(time.time())
 
@@ -479,7 +553,8 @@ def install_package(package: media.PathInput, target_ufs: media.PathInput, outpu
 
     for path, item in payload.items():
         target = destination(path)
-        if target == "/NextLibrary/Receipts" or target.startswith("/NextLibrary/Receipts/"):
+        if any(target == root or target.startswith(root + "/")
+               for root in ("/NextLibrary/Receipts", receipt_root)):
             raise ValueError(f"package payload overlaps receipt storage: {path}")
         if target in planned:
             raise ValueError(f"package paths resolve to the same destination: {target}")

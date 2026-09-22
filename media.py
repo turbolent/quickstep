@@ -30,11 +30,12 @@ MANIFEST = ".media-metadata"
 __all__ = [
     "DriverImage", "MediaError", "PathInput", "DiskLabel", "FilesystemInfo", "ImageInfo", "IsoLayout",
     "nextufs", "new_output", "resolve_iso_tool", "image_info", "cd_layout", "extract_ufs", "grow_image",
-    "check_image", "pad_image", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
+    "check_image", "pad_image", "copy_kernel", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
     "prepare_installation_drivers", "verify_boot_cd",
     "skip_boot_language_selection",
     "remove_boot_languages",
-    "remove_language_packages", "patch_builddisk_language_heading",
+    "remove_language_packages", "patch_builddisk_language_heading", "patch_builddisk_capacity",
+    "fix_builddisk_capacity",
     "SetupPackage", "SetupChoice", "SetupCatalog", "setup_plist",
     "validate_setup_app", "prepare_setup_app", "verify_setup_app",
     "copy_directory", "verify_directory_copy",
@@ -881,6 +882,25 @@ def patch_kernel_pic_bug(source: PathInput, output: PathInput, *, nextufs_binary
         check_image(staged, nextufs_binary=nextufs_binary)
 
 
+def copy_kernel(source_image: PathInput, target_image: PathInput, output: PathInput, *,
+                nextufs_binary: PathInput | None = None) -> None:
+    """Copy an image's i386 kernel to a new target-image copy, retaining target metadata."""
+    binary = executable(nextufs_binary)
+    kernel = _i386_kernel(Image(binary, source_image).read("/mach_kernel"))
+    if struct.unpack_from("<I", kernel, 12)[0] != 2:
+        raise ValueError("expected an executable i386 kernel")
+    with new_output(output, source=target_image) as staged:
+        image = Image(binary, staged)
+        entry = image.inspect("/mach_kernel")[0]
+        if not stat.S_ISREG(entry.mode):
+            raise ValueError("target /mach_kernel must be a regular file")
+        image.write("/mach_kernel", kernel, entry, exists=True)
+        _verify_metadata(entry, image.inspect("/mach_kernel")[0], "/mach_kernel")
+        if image.read("/mach_kernel") != kernel:
+            raise ValueError("copied kernel readback failed")
+        check_image(staged, nextufs_binary=binary)
+
+
 def _i386_kernel(kernel: bytes) -> bytes:
     """Extract the Intel kernel from a legacy fat Mach-O, or accept a thin one."""
     if kernel[:4] == bytes.fromhex("cafebabe"):
@@ -999,7 +1019,7 @@ _INSTALL_PIC_HOOK = br'''    echo "Installing PIC-patched kernel on the startup 
     fi
     echo "Installing /usr/bin/fix-pic-bug on the startup disk..."
     if ${CP} -p "${CDDIR}/fix-pic-bug" "${HD}/usr/bin/fix-pic-bug"; then
-        echo "PIC patch helper installed; run it after installing User Patch 4."
+        echo "PIC patch helper installed; run it after replacing the kernel."
     else
         echo "Cannot install PIC patch helper; installation stopped."
         exit 1
@@ -1180,11 +1200,57 @@ _BUILDDISK_LANGUAGE_ROW_FIXED = bytes.fromhex(
     "83c4148b55088b82b000000085c00f84e9000000807819000f84df0000009090"
     "6a008b95dcfdffff52428995dcfdffff8b0db0c91600518b15acc91600528b4d088b492051"
     "e80eb0ff0483c40850e805b0ff0489c683c410")
+
+
+@dataclass(frozen=True)
+class _BuildDiskPatch:
+    offset: int  # File offset within the Intel Mach-O slice (VA minus 0x2000).
+    original: bytes
+    fixed: bytes
+
+
+_BUILDDISK_LANGUAGE_PATCHES = (
+    _BuildDiskPatch(0x641f, _BUILDDISK_LANGUAGE_ROW, _BUILDDISK_LANGUAGE_ROW_FIXED),
+)
+_BUILDDISK_CAPACITY_PATCHES = (
+    # The sole caller now receives KiB, so it must not divide by 1024 again.
+    _BuildDiskPatch(0x5b5f, bytes.fromhex("c1e80a"), bytes.fromhex("909090")),
+    # Retarget the non-512-byte-sector and valid-MBR branches into the new tail.
+    _BuildDiskPatch(0xf257, bytes.fromhex("755e"), bytes.fromhex("7544")),
+    _BuildDiskPatch(0xf280, bytes.fromhex("741e"), bytes.fromhex("7405")),
+    _BuildDiskPatch(0xf282, bytes.fromhex(
+        "57e8b10fff048b45d8c1e009eb3457e8a30fff048b430cc1e009eb269090"
+        "8d98be01000031c0807b04a774e24083c31083f8037ef1"
+        "57e87c0fff048b45d80faf45dc"), bytes.fromhex(
+        "8b45d8eb258d98be010000b904000000807b04a7741183c310e2f5"
+        "8b45d8f765dc0facd00aeb058b430cd1e85057e8840fff0483c40458eb09"
+        "909090909090909090")),
+)
 _BUILDDISK_PROFILES = (
     # Stock OPENSTEP 4.2 three-architecture executable and its Intel slice.
-    (0x3c41f, "78bc4589785421a0b0e0b6a5281458c8e10125a0a3bb67fe8478e4c0b51f2fa5"),
-    (0x641f, "f6274672318d3d0acae7dd5489242516d7529ea37261428a0e5f8641892cc8ff"),
+    (0x36000, "78bc4589785421a0b0e0b6a5281458c8e10125a0a3bb67fe8478e4c0b51f2fa5"),
+    (0, "f6274672318d3d0acae7dd5489242516d7529ea37261428a0e5f8641892cc8ff"),
 )
+
+
+def _patch_builddisk(binary: bytes, patches: tuple[_BuildDiskPatch, ...]) -> bytes:
+    """Recognize stock or fully applied fixes, then apply one independent fix."""
+    for base, checksum in _BUILDDISK_PROFILES:
+        original = bytearray(binary)
+        for group in (_BUILDDISK_LANGUAGE_PATCHES, _BUILDDISK_CAPACITY_PATCHES):
+            actual = tuple(binary[base + p.offset:base + p.offset + len(p.original)] for p in group)
+            if actual not in (tuple(p.original for p in group), tuple(p.fixed for p in group)):
+                break
+            for p in group:
+                original[base + p.offset:base + p.offset + len(p.original)] = p.original
+        else:
+            if hashlib.sha256(original).hexdigest() != checksum:
+                continue
+            result = bytearray(binary)
+            for p in patches:
+                result[base + p.offset:base + p.offset + len(p.original)] = p.fixed
+            return bytes(result)
+    raise ValueError("unsupported BuildDisk executable (expected stock OPENSTEP 4.2 or known complete fixes)")
 
 
 def patch_builddisk_language_heading(binary: bytes) -> bytes:
@@ -1195,16 +1261,51 @@ def patch_builddisk_language_heading(binary: bytes) -> bytes:
     stack cleanup owed by the preceding Essentials row on either exit.
     The unused row otherwise keeps its prototype tag as well as its title;
     merely blanking the NIB title leaves an unsafe selectable cell.
-    Accept only known stock 4.2 executables or this exact patch.
+    Accept known stock 4.2 executables and either of our complete fixes.
     """
-    size = len(_BUILDDISK_LANGUAGE_ROW)
-    for offset, checksum in _BUILDDISK_PROFILES:
-        if binary[offset:offset + size] not in (_BUILDDISK_LANGUAGE_ROW, _BUILDDISK_LANGUAGE_ROW_FIXED):
-            continue
-        original = binary[:offset] + _BUILDDISK_LANGUAGE_ROW + binary[offset + size:]
-        if hashlib.sha256(original).hexdigest() == checksum:
-            return binary[:offset] + _BUILDDISK_LANGUAGE_ROW_FIXED + binary[offset + size:]
-    raise ValueError("unsupported BuildDisk executable for the language-heading fix (expected OPENSTEP 4.2)")
+    return _patch_builddisk(binary, _BUILDDISK_LANGUAGE_PATCHES)
+
+
+def patch_builddisk_capacity(binary: bytes) -> bytes:
+    """Fix the 4 GiB disk-size overflow in the Intel OPENSTEP 4.2 BuildDisk.
+
+    The helper at VA 0x111b0 multiplies sectors by sector size in 32-bit bytes;
+    its sole caller at 0x7b51 then divides by 1024. Exactly 4 GiB wraps to zero,
+    disabling package selection and offering to initialize the disk as swap.
+
+    Return KiB instead: divide 512-byte sector counts by two, or use unsigned
+    MUL's 64-bit product followed by SHRD for other sector sizes. Preserve the
+    MBR's first NeXT-partition selection, whole-disk fallback, error returns,
+    and callee-saved registers. Share close(), saving the result across it.
+    Remove the caller's now-redundant shift. All edits are same-length; no
+    Mach-O layout or other architecture changes. This fixes reporting, not
+    the kernel/filesystem's maximum supported partition size.
+    """
+    return _patch_builddisk(binary, _BUILDDISK_CAPACITY_PATCHES)
+
+
+def fix_builddisk_capacity(user_ufs: PathInput, output: PathInput, *,
+                           nextufs_binary: PathInput | None = None) -> None:
+    """Copy a User UFS with the guarded BuildDisk capacity fix, retaining metadata."""
+    binary = executable(nextufs_binary)
+    _raw_ufs_info(user_ufs, binary)
+    source = Image(binary, user_ufs)
+    application = "/NextAdmin/BuildDisk.app"
+    app_entry = _directory(source, application)
+    path = application + "/BuildDisk"
+    entry = source.inspect(path)[0]
+    original = source.read(path, entry)
+    patched = patch_builddisk_capacity(original)
+    with new_output(output, source=user_ufs) as staged:
+        target = Image(binary, staged)
+        if patched != original:
+            target.write(path, patched, entry, exists=True)
+            target.metadata(application, app_entry)
+        if target.read(path) != patched:
+            raise ValueError("BuildDisk capacity fix readback failed")
+        _verify_metadata(entry, target.inspect(path)[0], path)
+        _verify_metadata(app_entry, target.inspect(application)[0], application)
+        check_image(staged, nextufs_binary=binary)
 
 
 def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
@@ -1875,13 +1976,16 @@ def check_payload(iso: PathInput, lba: int, source: PathInput) -> None:
 def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                    ufs: PathInput, iso: PathInput, *, nextufs_binary: PathInput | None = None,
                    installation_drivers: bool = False, fix_pic_bug: bool = False,
-                   package_hook: bytes = b"", packaged_drivers: Iterable[str] = ()) -> None:
+                   package_hook: bytes = b"", packaged_drivers: Iterable[str] = (),
+                   kernel_source: PathInput | None = None) -> None:
     """Check bootloader, El Torito payloads, User UFS, and installer access.
 
     Read-only verification, including fsck of the prepared floppy; this does not
     establish that the ISO boots successfully in a VM. With installation_drivers,
     verify the installer hook, driver archive and optional patched kernel instead
     of requiring the embedded User UFS to be byte-identical to the original CD.
+    kernel_source identifies the independently prepared patched User filesystem;
+    omit it to require the original CD and boot-floppy kernels.
     """
     boot_disk, boot, user_cd, ufs, iso = map(Path, (boot_disk, boot, user_cd, ufs, iso))
     packaged_drivers = tuple(packaged_drivers)
@@ -1893,6 +1997,12 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     for offset, (old, new) in enumerate(zip(original, grown)):
         if old != new and not any(label <= offset < label + 0x300 for label in (7680, 15360, 23040)):
             raise ValueError("bootloader bytes changed")
+    expected_boot = nextufs("browse", "--raw", kernel_source or boot_disk, "/mach_kernel", binary=nextufs_binary)
+    expected_boot = _i386_kernel(expected_boot)
+    if fix_pic_bug:
+        expected_boot = patch_pic_kernel(expected_boot)
+    if nextufs("browse", "--raw", boot, "/mach_kernel", binary=nextufs_binary) != expected_boot:
+        raise ValueError("boot-floppy kernel differs from the expected Intel kernel")
     layout = iso_layout(iso)
     check_payload(iso, layout.boot_lba, boot)
     check_payload(iso, layout.ufs_lba, ufs)
@@ -1908,9 +2018,9 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
         archive = nextufs("browse", "--raw", iso, _INSTALL_DRIVER_ARCHIVE, binary=nextufs_binary)
         if archive != _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers):
             raise ValueError("installation drivers differ from the boot floppy")
-        original_kernel = nextufs("browse", "--raw", user_cd, "/mach_kernel", binary=nextufs_binary)
+        original_kernel = nextufs("browse", "--raw", kernel_source or user_cd, "/mach_kernel", binary=nextufs_binary)
         if nextufs("browse", "--raw", iso, "/mach_kernel", binary=nextufs_binary) != original_kernel:
-            raise ValueError("User CD kernel changed")
+            raise ValueError("User CD kernel differs from the expected kernel")
         if fix_pic_bug:
             expected_kernel = patch_pic_kernel(_i386_kernel(original_kernel))
             if nextufs("browse", "--raw", iso, _INSTALL_KERNEL, binary=nextufs_binary) != expected_kernel:

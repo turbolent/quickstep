@@ -118,7 +118,8 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
 def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | None,
             output: PathInput, *, nextufs_binary: PathInput | None = None,
             installation_driver_bundles: Sequence[PathInput] = (),
-            use_bus_master_ide: bool = False, remove_languages: bool = False) -> None:
+            use_bus_master_ide: bool = False, remove_languages: bool = False,
+            kernel_source: PathInput | None = None) -> None:
     """Make a grown, driver-equipped copy; publish only after every step succeeds."""
     print(f"Copying boot floppy from {boot_disk}...", flush=True)
     with media.new_output(output, source=boot_disk) as image:
@@ -129,6 +130,11 @@ def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput |
         if remove_languages:
             print("Removing non-English boot-floppy translations...", flush=True)
             media.remove_boot_languages(image, nextufs_binary=nextufs_binary)
+        if kernel_source is not None:
+            print("Copying Patch 4 Intel kernel to the boot floppy...", flush=True)
+            with_kernel = image.parent / "boot-kernel.img"
+            media.copy_kernel(kernel_source, image, with_kernel, nextufs_binary=nextufs_binary)
+            with_kernel.replace(image)
         install_drivers(image, driver_disk, beta_disk, image.parent, nextufs_binary=nextufs_binary,
                         installation_driver_bundles=installation_driver_bundles,
                         use_bus_master_ide=use_bus_master_ide)
@@ -207,9 +213,17 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         installer = iso.parent / "installer.ufs"
         installed_drivers: list[pkg.InstalledDriver] = []
         driver_bundles: list[Path] = []
-        if required_drivers:
-            print(f"Extracting User CD filesystem from {user_cd}...", flush=True)
-            media.extract_ufs(user_cd, ufs, nextufs_binary=nextufs_binary)
+        print(f"Extracting User CD filesystem from {user_cd}...", flush=True)
+        media.extract_ufs(user_cd, ufs, nextufs_binary=nextufs_binary)
+        kernel_source: Path | None = None
+        prepared_patch: pkg.PreparedUserPatch | None = None
+        package_hook = b""
+        if user_patch is not None:
+            print("Applying User Patch 4 to the CD filesystem...", flush=True)
+            patched_user = iso.parent / "user-patch4.ufs"
+            prepared_patch = pkg.prepare_user_patch(user_patch, ufs, patched_user, nextufs_binary=nextufs_binary)
+            ufs = kernel_source = patched_user
+            package_hook = pkg.user_patch_installation_hook(prepared_patch)
         for index, path in enumerate(required_drivers):
             packaged = iso.parent / f"installation-driver-{index}.ufs"
             print(f"Installing driver package from {path} on the CD...", flush=True)
@@ -228,20 +242,21 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             installed_drivers.append(installed)
             driver_bundles.append(bundle)
             ufs = packaged
-        package_hook = pkg.installation_hook(item.package for item in installed_drivers)
+        package_hook += pkg.installation_hook(item.package for item in installed_drivers)
         packaged_drivers = tuple(item.name for item in installed_drivers)
         print(f"Preparing boot floppy and drivers from {boot_disk}...", flush=True)
         drivers(boot_disk, driver_disk, beta_disk, boot, nextufs_binary=nextufs_binary,
                 installation_driver_bundles=driver_bundles, use_bus_master_ide=bus_master_ide is not None,
-                remove_languages=remove_languages)
-        if not required_drivers:
-            print(f"Extracting User CD filesystem from {user_cd}...", flush=True)
-            media.extract_ufs(user_cd, ufs, nextufs_binary=nextufs_binary)
+                remove_languages=remove_languages, kernel_source=kernel_source)
         if remove_languages:
             print("Removing optional non-English language packages and receipts...", flush=True)
             pruned = iso.parent / "english.ufs"
             media.remove_language_packages(ufs, pruned, nextufs_binary=nextufs_binary)
             ufs = pruned
+        print("Fixing BuildDisk's 4 GiB capacity calculation...", flush=True)
+        with_builddisk = iso.parent / "builddisk.ufs"
+        media.fix_builddisk_capacity(ufs, with_builddisk, nextufs_binary=nextufs_binary)
+        ufs = with_builddisk
         if fix_pic_bug:
             print("Applying kernel PIC fix if needed...", flush=True)
             patched = iso.parent / "boot-picfix.img"
@@ -261,7 +276,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             installer = combined
         for archive, package in patches:
             if archive is not None:
-                print(f"Adding {package} for manual installation...", flush=True)
+                purpose = "for reuse on other systems" if archive == user_patch else "for manual installation"
+                print(f"Adding {package} {purpose}...", flush=True)
                 patched_ufs = iso.parent / (package + ".ufs")
                 media.copy_tar(archive, installer, "/NextCD/Packages", patched_ufs,
                                nextufs_binary=nextufs_binary)
@@ -284,7 +300,12 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         print("Verifying boot image and ISO...", flush=True)
         media.verify_boot_cd(boot_disk, boot, user_cd, installer, iso, nextufs_binary=nextufs_binary,
                              installation_drivers=True, fix_pic_bug=fix_pic_bug,
-                             package_hook=package_hook, packaged_drivers=packaged_drivers)
+                             package_hook=package_hook, packaged_drivers=packaged_drivers,
+                             kernel_source=kernel_source)
+        if prepared_patch is not None:
+            assert kernel_source is not None
+            media.verify_directory_copy(kernel_source, prepared_patch.receipt_source, iso,
+                                        prepared_patch.receipt_source, nextufs_binary=nextufs_binary)
         if developer_cd is not None:
             media.verify_directory_copy(developer_cd, "/NextCD/Packages", iso, "/NextCD/Packages",
                                         nextufs_binary=nextufs_binary)
@@ -312,7 +333,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--nextufs", help="nextufs executable (default: automatic discovery)")
     parser.add_argument("--developer-cd", type=Path,
                         help="Developer CD image whose packages will be included for manual installation")
-    parser.add_argument("--user-patch", type=Path, help="OS42MachUserPatch4.tar to include for manual installation")
+    parser.add_argument("--user-patch", type=Path,
+                        help="apply OS42MachUserPatch4.tar to the boot kernel, CD and installed system; also retain its package")
     parser.add_argument("--developer-patch", type=Path, help="OS42MachDevPatch4.tar to include for manual installation")
     parser.add_argument("--profile-libs-patch", type=Path,
                         help="OS42MachPLibPatch4.tar to include for manual installation")

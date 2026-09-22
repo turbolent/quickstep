@@ -49,7 +49,9 @@ python3 build_cd.py \
   Debug symbols are stripped automatically from boot-floppy driver binaries;
   the original packages and the payloads installed on the CD and startup disk remain unchanged.
 - `--developer-cd /path/to/Developer.iso`: include the Developer CD packages.
-- `--user-patch /path/to/OS42MachUserPatch4.tar`: include User Patch 4.
+- `--user-patch /path/to/OS42MachUserPatch4.tar`: apply User Patch 4 to the CD filesystem and boot-floppy kernel, and install it automatically on the startup disk.
+  The startup disk receives the complete patch, its receipt, and the VBE-enabled bootloader.
+  The CD's existing bootloader is retained; the original package is also included for use on other systems.
 - `--developer-patch /path/to/OS42MachDevPatch4.tar`: include Developer Patch 4.
 - `--profile-libs-patch /path/to/OS42MachPLibPatch4.tar`: include Profiling Libraries Patch 4.
 - `--setup-app /path/to/Setup.app`: include the native post-installation package selector (see [building Setup.app](setup/README.md)).
@@ -67,9 +69,10 @@ python3 build_cd.py \
 - `--nextufs /path/to/nextufs`: select the nextufs executable explicitly.
 - `--iso-tool /path/to/xorriso`: select an ISO tool explicitly (`mkisofs`, `genisoimage`, or `xorriso`).
 
-Developer and Patch 4 packages are copied to `/NextCD/Packages` on the ISO for manual installation with Installer.app after setup.
-They are not installed automatically.
-Manually installing User Patch 4 replaces the installed kernel.
+Developer packages, Developer Patch 4, and Profiling Libraries Patch 4 are copied to `/NextCD/Packages` for manual installation with Installer.app after setup.
+Only User Patch 4 is applied automatically when supplied.
+With `--fix-pic-bug`, the PIC fix is applied after Patch 4 to both the boot and installed kernels.
+Manually reinstalling User Patch 4 replaces the installed kernel.
 If you built with `--fix-pic-bug`, run `/usr/bin/fix-pic-bug` as root after installing the patch and before rebooting.
 The helper supports stock OPENSTEP 4.2 and Patch 4 kernels, leaves already-patched kernels unchanged, and refuses unknown kernels.
 It saves the original as `/mach_kernel.pre-pic-fix` without overwriting an existing backup.
@@ -78,6 +81,7 @@ The package itself is not modified.
 ### Setup.app
 
 When included, open Setup.app from the mounted CD after booting and configuring the installed system, logged in as root.
+Setup recognizes the automatically installed User Patch 4 receipt and skips reinstalling it.
 FramebufferWC is unchecked by default and is not installed or activated by building or booting the CD.
 If its post-install action fails, Setup offers Retry without reinstalling the package.
 Selecting it again in a later Setup session safely reapplies the patch and activation, including after reinstalling User Patch 4.
