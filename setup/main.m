@@ -302,7 +302,7 @@ static NSString *stampText(NSDictionary *stamp, NSString *key)
         error = @"Cannot read Setup.plist.";
     NS_ENDHANDLER
     if (!model) {
-        [self alert:[NSString stringWithFormat:@"%@\nInclude this bundle using build_cd.py --setup-app.", error]];
+        [self alert:[NSString stringWithFormat:@"%@\nInclude this bundle using build.py --setup-app.", error]];
         return NO;
     }
     available = [[NSMutableSet alloc] init]; installed = [[NSMutableSet alloc] init];

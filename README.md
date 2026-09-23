@@ -26,7 +26,7 @@ Build an El Torito bootable OPENSTEP 4.2 Intel CD, or a native bootable USB disk
 Run from the workspace root, substituting the paths to your images:
 
 ```sh
-python3 build_cd.py \
+python3 build.py \
   --boot-disk "4.2_Install_Disk.img" \
   --driver-disk "4.2_Driver_Disk.img" \
   --beta-disk "4.2_Beta_Drivers_1.img" \

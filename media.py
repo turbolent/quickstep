@@ -1,7 +1,7 @@
 """Offline OPENSTEP media and driver operations.
 
 UFS access is delegated to the nextufs executable.
-See build_cd.py for an example bootable-CD recipe using this library.
+See build.py for an example CD/USB recipe using this library.
 """
 
 from collections.abc import Iterable, Iterator, Mapping
