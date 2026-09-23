@@ -1,12 +1,12 @@
-# OPENSTEP 4.2 bootable CD builder
+# OPENSTEP 4.2 installation media builder
 
-Build an El Torito bootable OPENSTEP 4.2 Intel CD from the original installation media.
+Build an El Torito bootable OPENSTEP 4.2 Intel CD, or a native bootable USB disk image, from the original installation media.
 
 ## Requirements
 
 - Python 3.11 or newer; no pip packages are needed.
 - [nextufs-offline](https://github.com/turbolent/nextufs-offline).
-- One ISO tool on `PATH`: `mkisofs`, `genisoimage`, or `xorriso`.
+- For CD output, one ISO tool on `PATH`: `mkisofs`, `genisoimage`, or `xorriso`.
 - OPENSTEP 4.2 installation media:
   - Boot floppy
   - Driver floppy
@@ -36,6 +36,7 @@ python3 build_cd.py \
 
 ### Optional flags
 
+- `--usb`: create a raw USB disk image instead of the default CD ISO (see below).
 - **Recommended** `--bus-master-ide /path/to/BusMasterIDE.pkg`: install BusMasterIDE instead of EIDE; `--beta-disk` is then unnecessary.
   Accepts a `.pkg` directory or a single-package tar archive, not an extracted `.config` bundle.
 - `--installation-driver /path/to/Driver.pkg`: install a driver on the boot floppy, CD filesystem, and startup disk automatically.
@@ -68,6 +69,7 @@ python3 build_cd.py \
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.
 - `--nextufs /path/to/nextufs`: select the nextufs executable explicitly.
 - `--iso-tool /path/to/xorriso`: select an ISO tool explicitly (`mkisofs`, `genisoimage`, or `xorriso`).
+  This option cannot be combined with `--usb`.
 
 Developer packages, Developer Patch 4, and Profiling Libraries Patch 4 are copied to `/NextCD/Packages` for manual installation with Installer.app after setup.
 Only User Patch 4 is applied automatically when supplied.
@@ -77,6 +79,20 @@ If you built with `--fix-pic-bug`, run `/usr/bin/fix-pic-bug` as root after inst
 The helper supports stock OPENSTEP 4.2 and Patch 4 kernels, leaves already-patched kernels unchanged, and refuses unknown kernels.
 It saves the original as `/mach_kernel.pre-pic-fix` without overwriting an existing backup.
 The package itself is not modified.
+
+### Build and boot a USB image
+
+Add `--usb --output openstep-usb.img` to your build command. Include PCIMSI followed
+by XHCI using `--installation-driver`, plus the destination disk's driver
+(for example, NVMeSCSIDriver).
+
+1. Write the image to the **entire USB stick** in raw/DD mode, overwriting its contents.
+2. Boot a USB 2.0 stick on an xHCI controller using legacy BIOS/CSM, with the stick as the first BIOS hard disk.
+3. At the installer's first restart, boot the destination disk and keep the stick attached until installation finishes.
+
+The installer defaults to `sd1b`. If the USB stick has another device number,
+enter `-a` at the `boot:` prompt, then select its installer partition, such as
+`sd0b`. The trailing **`b` is required**.
 
 ### Setup.app
 

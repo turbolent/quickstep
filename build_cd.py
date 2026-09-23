@@ -1,4 +1,4 @@
-"""Editable OPENSTEP 4.2 CD recipe; generic media operations live in media.py."""
+"""Editable OPENSTEP 4.2 CD/USB recipe; generic media operations live in media.py."""
 import argparse
 from collections.abc import Sequence
 from pathlib import Path
@@ -152,8 +152,10 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           remove_languages: bool = False, setup_app: PathInput | None = None,
           profile_libs_patch: PathInput | None = None,
           driver_packages: Sequence[PathInput] = (), framebuffer_wc: PathInput | None = None,
-          installation_drivers: Sequence[PathInput] = ()) -> None:
-    """Build and check the complete ISO; keep intermediates only until publication."""
+          installation_drivers: Sequence[PathInput] = (), usb: bool = False) -> None:
+    """Build and check installation media; publish only after all checks pass."""
+    if usb and iso_tool is not None:
+        raise ValueError("--iso-tool cannot be used with --usb")
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
     print("Checking input paths and build tools...", flush=True)
@@ -174,7 +176,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         if framebuffer_wc is not None and not (Path(setup_app) / "setup-framebuffer-wc.sh").is_file():
             raise ValueError("--framebuffer-wc requires a rebuilt Setup.app containing setup-framebuffer-wc.sh")
     nextufs_binary = media.executable(nextufs_binary)
-    iso_tool = media.resolve_iso_tool(iso_tool, nextufs_binary=nextufs_binary)
+    if not usb:
+        iso_tool = media.resolve_iso_tool(iso_tool, nextufs_binary=nextufs_binary)
     patches = ((user_patch, "OS42MachUserPatch4.pkg"),
                (developer_patch, "OS42MachDeveloperPatch4.pkg"),
                (profile_libs_patch, "OS42MachProfileLibPatch4.pkg"))
@@ -294,30 +297,46 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.prepare_setup_app(setup_app, installer, with_setup, catalog=catalog, fix_pic_bug=fix_pic_bug,
                                     nextufs_binary=nextufs_binary)
             installer = with_setup
-        print(f"Building ISO: {output}...", flush=True)
-        media.create_iso(boot, user_cd, installer, iso, volume_id=VOLUME_ID, iso_tool=iso_tool,
-                         nextufs_binary=nextufs_binary)
-        print("Verifying boot image and ISO...", flush=True)
-        media.verify_boot_cd(boot_disk, boot, user_cd, installer, iso, nextufs_binary=nextufs_binary,
-                             installation_drivers=True, fix_pic_bug=fix_pic_bug,
-                             package_hook=package_hook, packaged_drivers=packaged_drivers,
-                             kernel_source=kernel_source)
+        print(f"Building {'USB image' if usb else 'ISO'}: {output}...", flush=True)
+        if usb:
+            usb_installer = iso.parent / "usb-installer.ufs"
+            media.prepare_usb_installer(installer, usb_installer, nextufs_binary=nextufs_binary)
+            installer = usb_installer
+            media.create_usb(boot, installer, iso, nextufs_binary=nextufs_binary)
+            print("Verifying USB boot files and installer...", flush=True)
+            media.verify_boot_usb(boot_disk, boot, user_cd, installer, iso,
+                                  nextufs_binary=nextufs_binary, fix_pic_bug=fix_pic_bug,
+                                  package_hook=package_hook, packaged_drivers=packaged_drivers,
+                                  kernel_source=kernel_source)
+            # verify_boot_usb checks partition b against this UFS, allowing only
+            # the superblock conversion to the USB label's logical block size.
+            # nextufs's default whole-disk view selects the boot partition a.
+            contents = installer
+        else:
+            media.create_iso(boot, user_cd, installer, iso, volume_id=VOLUME_ID, iso_tool=iso_tool,
+                             nextufs_binary=nextufs_binary)
+            print("Verifying boot image and ISO...", flush=True)
+            media.verify_boot_cd(boot_disk, boot, user_cd, installer, iso, nextufs_binary=nextufs_binary,
+                                 installation_drivers=True, fix_pic_bug=fix_pic_bug,
+                                 package_hook=package_hook, packaged_drivers=packaged_drivers,
+                                 kernel_source=kernel_source)
+            contents = iso
         if prepared_patch is not None:
             assert kernel_source is not None
-            media.verify_directory_copy(kernel_source, prepared_patch.receipt_source, iso,
+            media.verify_directory_copy(kernel_source, prepared_patch.receipt_source, contents,
                                         prepared_patch.receipt_source, nextufs_binary=nextufs_binary)
         if developer_cd is not None:
-            media.verify_directory_copy(developer_cd, "/NextCD/Packages", iso, "/NextCD/Packages",
+            media.verify_directory_copy(developer_cd, "/NextCD/Packages", contents, "/NextCD/Packages",
                                         nextufs_binary=nextufs_binary)
         for archive, _ in patches:
             if archive is not None:
-                media.verify_tar_copy(archive, iso, "/NextCD/Packages", nextufs_binary=nextufs_binary)
+                media.verify_tar_copy(archive, contents, "/NextCD/Packages", nextufs_binary=nextufs_binary)
         for archive in driver_archives:
-            media.verify_tar_copy(archive, iso, "/NextCD/Packages", nextufs_binary=nextufs_binary)
+            media.verify_tar_copy(archive, contents, "/NextCD/Packages", nextufs_binary=nextufs_binary)
         if setup_app is not None:
-            media.verify_setup_app(setup_app, iso, catalog=catalog, fix_pic_bug=fix_pic_bug,
+            media.verify_setup_app(setup_app, contents, catalog=catalog, fix_pic_bug=fix_pic_bug,
                                    nextufs_binary=nextufs_binary)
-    print(f"Created bootable ISO: {output}")
+    print(f"Created bootable {'USB image' if usb else 'ISO'}: {output}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -326,10 +345,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("boot_disk", "boot floppy"),
         ("driver_disk", "driver floppy"),
         ("user_cd", "User CD image"),
-        ("output", "new bootable ISO to create"),
+        ("output", "new ISO or USB disk image to create"),
     ):
         parser.add_argument("--" + name.replace("_", "-"), type=Path, required=True, help=description)
     parser.add_argument("--iso-tool", help="mkisofs, genisoimage, or xorriso executable")
+    parser.add_argument("--usb", action="store_true",
+                        help="create a raw BIOS-bootable USB disk image instead of a CD ISO")
     parser.add_argument("--nextufs", help="nextufs executable (default: automatic discovery)")
     parser.add_argument("--developer-cd", type=Path,
                         help="Developer CD image whose packages will be included for manual installation")
@@ -364,7 +385,8 @@ def main(argv: Sequence[str] | None = None) -> int:
               user_patch=args.user_patch, developer_patch=args.developer_patch,
               remove_languages=args.remove_languages, setup_app=args.setup_app,
               profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package,
-              framebuffer_wc=args.framebuffer_wc, installation_drivers=args.installation_driver)
+              framebuffer_wc=args.framebuffer_wc, installation_drivers=args.installation_driver,
+              usb=args.usb)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"build_cd.py: {exc}\n")
     return 0
