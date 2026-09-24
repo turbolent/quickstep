@@ -23,6 +23,7 @@ import tempfile
 from typing import TypeAlias
 
 from macho import strip_driver_debug
+from configure_patch import patch_configure_order
 
 
 ROOT = "/private/Drivers/i386"
@@ -37,6 +38,8 @@ __all__ = [
     "remove_boot_languages",
     "remove_language_packages", "patch_builddisk_language_heading", "patch_builddisk_capacity",
     "fix_builddisk_capacity",
+    "patch_configure_order", "fix_configure_order", "verify_configure_order",
+    "configure_order_installation_hook",
     "SetupPackage", "SetupChoice", "SetupCatalog", "setup_plist",
     "validate_setup_app", "prepare_setup_app", "verify_setup_app",
     "copy_directory", "verify_directory_copy",
@@ -1504,6 +1507,63 @@ def fix_builddisk_capacity(user_ufs: PathInput, output: PathInput, *,
             target.metadata(application, app_entry)
         if target.read(path) != patched:
             raise ValueError("BuildDisk capacity fix readback failed")
+        _verify_metadata(entry, target.inspect(path)[0], path)
+        _verify_metadata(app_entry, target.inspect(application)[0], application)
+        check_image(staged, nextufs_binary=binary)
+
+
+def configure_order_installation_hook() -> bytes:
+    """Copy the verified executable and its backup beyond the stock BOM filter."""
+    return br'''    echo "Installing order-preserving Configure..."
+    if ${CP} -p "${ROOT}/NextAdmin/Configure.app/Configure.pre-driver-order" "${HD}/NextAdmin/Configure.app/Configure.pre-driver-order" &&
+        ${CP} -p "${ROOT}/NextAdmin/Configure.app/Configure" "${HD}/NextAdmin/Configure.app/Configure"; then
+        echo "Configure order fix and stock backup installed."
+    else
+        echo "Cannot install Configure order fix; installation stopped."
+        exit 1
+    fi
+'''
+
+
+def verify_configure_order(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Require a patched Configure and its exact, recoverable stock backup."""
+    target = Image(executable(nextufs_binary), image)
+    path = "/NextAdmin/Configure.app/Configure"
+    backup = target.read(path + ".pre-driver-order")
+    patched = patch_configure_order(backup)
+    if backup == patched or target.read(path) != patched:
+        raise ValueError("Configure order fix or stock backup verification failed")
+
+
+def fix_configure_order(user_ufs: PathInput, output: PathInput, *,
+                        nextufs_binary: PathInput | None = None) -> None:
+    """Copy a User UFS with order-preserving Configure and a stock backup."""
+    binary = executable(nextufs_binary)
+    _raw_ufs_info(user_ufs, binary)
+    source = Image(binary, user_ufs)
+    application = "/NextAdmin/Configure.app"
+    app_entry = _directory(source, application)
+    path = application + "/Configure"
+    entry = source.inspect(path)[0]
+    original = source.read(path, entry)
+    patched = patch_configure_order(original)
+    backup_name = "Configure.pre-driver-order"
+    backup = source.child(application, backup_name)
+    if backup is not None:
+        saved = source.read(application + "/" + backup_name, backup)
+        if saved == patch_configure_order(saved) or patch_configure_order(saved) != patched:
+            raise ValueError("Configure stock backup does not match this executable")
+    elif original == patched:
+        raise ValueError("already-patched Configure requires a verified stock backup")
+    with new_output(output, source=user_ufs) as staged:
+        target = Image(binary, staged)
+        if backup is None:
+            target.write(application + "/" + backup_name, original, entry, exists=False)
+        if patched != original:
+            target.write(path, patched, entry, exists=True)
+        if backup is None or patched != original:
+            target.metadata(application, app_entry)
+        verify_configure_order(staged, nextufs_binary=binary)
         _verify_metadata(entry, target.inspect(path)[0], path)
         _verify_metadata(app_entry, target.inspect(application)[0], application)
         check_image(staged, nextufs_binary=binary)

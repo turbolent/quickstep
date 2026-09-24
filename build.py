@@ -306,6 +306,11 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         with_builddisk = iso.parent / "builddisk.ufs"
         media.fix_builddisk_capacity(ufs, with_builddisk, nextufs_binary=nextufs_binary)
         ufs = with_builddisk
+        print("Preserving driver order through Configure's installation setup...", flush=True)
+        with_configure = iso.parent / "configure.ufs"
+        media.fix_configure_order(ufs, with_configure, nextufs_binary=nextufs_binary)
+        ufs = with_configure
+        package_hook += media.configure_order_installation_hook()
         if fix_pic_bug:
             print("Applying kernel PIC fix if needed...", flush=True)
             patched = iso.parent / "boot-picfix.img"
@@ -370,6 +375,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                                  kernel_source=kernel_source, removed_drivers=removed_drivers, disk_limits=True,
                                  bootloader_source=bootloader_source)
             contents = iso
+        media.verify_configure_order(contents, nextufs_binary=nextufs_binary)
         if framebuffer_wc is not None:
             media.verify_framebuffer_wc(contents, nextufs_binary=nextufs_binary)
         if prepared_patch is not None:
