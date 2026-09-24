@@ -66,6 +66,9 @@ python3 build.py \
   Reboot afterward to use the drivers.
 - `--remove-languages`: remove non-English boot-floppy translations and additional language packages and their receipt entries from the generated CD.
   English and existing localized files in the base system are retained.
+- `--remove-ps2`: remove `PS2Keyboard` and `PS2Mouse` from the boot image and installed system, including their activation entries.
+  Works with both CD and USB output. Include replacement keyboard and mouse support using `--installation-driver`.
+  The installer removes the startup disk's PS/2 bundles after copying the base system, before rebooting.
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.
 - `--nextufs /path/to/nextufs`: select the nextufs executable explicitly.
 - `--iso-tool /path/to/xorriso`: select an ISO tool explicitly (`mkisofs`, `genisoimage`, or `xorriso`).

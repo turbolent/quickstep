@@ -13,6 +13,7 @@ from media import PathInput
 # Recipe choices: edit these and install_drivers() to build a different CD.
 VOLUME_ID = "OPENSTEP_4_2"
 BOOT_DRIVERS = ("PS2Keyboard", "EISABus", "PCIBus", "Intel824X0", "EIDE")
+PS2_DRIVERS = ("PS2Keyboard", "PS2Mouse")
 SETUP_CATALOG = media.SetupCatalog(
     packages=(
         media.SetupPackage("OS42MachUserPatch4", "OPENSTEP Release 4.2 Patch 4",
@@ -42,7 +43,7 @@ SETUP_CATALOG = media.SetupCatalog(
 def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInput | None,
                     stage: Path, *, nextufs_binary: PathInput | None = None,
                     installation_driver_bundles: Sequence[PathInput] = (),
-                    use_bus_master_ide: bool = False) -> None:
+                    use_bus_master_ide: bool = False, remove_ps2: bool = False) -> None:
     """Prepare the boot drivers through the root media.py library only."""
     bundles: dict[str, Path] = {}
     for bundle in map(Path, installation_driver_bundles):
@@ -51,6 +52,8 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
         name = media.driver_name(bundle.name)
         if name in bundles or name == "System":
             raise ValueError(f"duplicate or reserved installation driver: {name}")
+        if remove_ps2 and name in PS2_DRIVERS:
+            raise ValueError(f"installation driver {name} conflicts with --remove-ps2")
         bundles[name] = bundle
     if use_bus_master_ide and "BusMasterIDE" not in bundles:
         raise ValueError("BusMasterIDE replacement bundle is missing")
@@ -58,7 +61,14 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
         raise ValueError("an EIDE installation driver conflicts with --bus-master-ide")
     target = media.DriverImage(image, nextufs=nextufs_binary)
     boot_drivers = tuple("BusMasterIDE" if name == "EIDE" and use_bus_master_ide else name
-                         for name in BOOT_DRIVERS)
+                         for name in BOOT_DRIVERS if not (remove_ps2 and name in PS2_DRIVERS))
+    if remove_ps2:
+        existing = target.list_drivers()
+        for name in PS2_DRIVERS:
+            print(f"Removing {name} from the boot floppy...", flush=True)
+            target.deactivate(name)
+            if name in existing:
+                target.remove(name)
     if use_bus_master_ide:
         print("Using packaged BusMasterIDE instead of EIDE...", flush=True)
         print("Deactivating EIDE...", flush=True)
@@ -119,6 +129,7 @@ def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput |
             output: PathInput, *, nextufs_binary: PathInput | None = None,
             installation_driver_bundles: Sequence[PathInput] = (),
             use_bus_master_ide: bool = False, remove_languages: bool = False,
+            remove_ps2: bool = False,
             kernel_source: PathInput | None = None) -> None:
     """Make a grown, driver-equipped copy; publish only after every step succeeds."""
     print(f"Copying boot floppy from {boot_disk}...", flush=True)
@@ -137,7 +148,7 @@ def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput |
             with_kernel.replace(image)
         install_drivers(image, driver_disk, beta_disk, image.parent, nextufs_binary=nextufs_binary,
                         installation_driver_bundles=installation_driver_bundles,
-                        use_bus_master_ide=use_bus_master_ide)
+                        use_bus_master_ide=use_bus_master_ide, remove_ps2=remove_ps2)
         print("Checking boot-floppy filesystem (fsck)...", flush=True)
         media.check_image(image, nextufs_binary=nextufs_binary)
         print(f"Padding boot floppy to {media.MAX_BOOT_FLOPPY_KIB} KiB...", flush=True)
@@ -149,7 +160,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           nextufs_binary: PathInput | None = None, bus_master_ide: PathInput | None = None,
           fix_pic_bug: bool = False, developer_cd: PathInput | None = None,
           user_patch: PathInput | None = None, developer_patch: PathInput | None = None,
-          remove_languages: bool = False, setup_app: PathInput | None = None,
+          remove_languages: bool = False, remove_ps2: bool = False, setup_app: PathInput | None = None,
           profile_libs_patch: PathInput | None = None,
           driver_packages: Sequence[PathInput] = (), framebuffer_wc: PathInput | None = None,
           installation_drivers: Sequence[PathInput] = (), usb: bool = False) -> None:
@@ -238,6 +249,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                 raise ValueError(f"duplicate installation driver or package: {installed.name}")
             if bus_master_ide is not None and installed.name == "EIDE":
                 raise ValueError("an EIDE installation driver conflicts with --bus-master-ide")
+            if remove_ps2 and installed.name in PS2_DRIVERS:
+                raise ValueError(f"installation driver {installed.name} conflicts with --remove-ps2")
             bundle = iso.parent / (installed.name + ".config")
             print(f"Extracting {installed.name} for the boot floppy...", flush=True)
             media.DriverImage(packaged, nextufs=nextufs_binary, driver_root=installed.package.location).extract(
@@ -247,10 +260,11 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             ufs = packaged
         package_hook += pkg.installation_hook(item.package for item in installed_drivers)
         packaged_drivers = tuple(item.name for item in installed_drivers)
+        removed_drivers = PS2_DRIVERS if remove_ps2 else ()
         print(f"Preparing boot floppy and drivers from {boot_disk}...", flush=True)
         drivers(boot_disk, driver_disk, beta_disk, boot, nextufs_binary=nextufs_binary,
                 installation_driver_bundles=driver_bundles, use_bus_master_ide=bus_master_ide is not None,
-                remove_languages=remove_languages, kernel_source=kernel_source)
+                remove_languages=remove_languages, remove_ps2=remove_ps2, kernel_source=kernel_source)
         if remove_languages:
             print("Removing optional non-English language packages and receipts...", flush=True)
             pruned = iso.parent / "english.ufs"
@@ -270,7 +284,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             print("Preparing PIC-patched kernel for the installed system...", flush=True)
         media.prepare_installation_drivers(boot, ufs, installer, nextufs_binary=nextufs_binary,
                                            fix_pic_bug=fix_pic_bug, package_hook=package_hook,
-                                           packaged_drivers=packaged_drivers)
+                                           packaged_drivers=packaged_drivers, removed_drivers=removed_drivers)
         if developer_cd is not None:
             print(f"Adding Developer CD packages from {developer_cd}...", flush=True)
             combined = iso.parent / "combined.ufs"
@@ -307,7 +321,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.verify_boot_usb(boot_disk, boot, user_cd, installer, iso,
                                   nextufs_binary=nextufs_binary, fix_pic_bug=fix_pic_bug,
                                   package_hook=package_hook, packaged_drivers=packaged_drivers,
-                                  kernel_source=kernel_source)
+                                  kernel_source=kernel_source, removed_drivers=removed_drivers)
             # verify_boot_usb checks partition b against this UFS, allowing only
             # the superblock conversion to the USB label's logical block size.
             # nextufs's default whole-disk view selects the boot partition a.
@@ -319,7 +333,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.verify_boot_cd(boot_disk, boot, user_cd, installer, iso, nextufs_binary=nextufs_binary,
                                  installation_drivers=True, fix_pic_bug=fix_pic_bug,
                                  package_hook=package_hook, packaged_drivers=packaged_drivers,
-                                 kernel_source=kernel_source)
+                                 kernel_source=kernel_source, removed_drivers=removed_drivers)
             contents = iso
         if prepared_patch is not None:
             assert kernel_source is not None
@@ -369,6 +383,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="apply the PIC interrupt fix to the boot and installed kernels")
     parser.add_argument("--remove-languages", action="store_true",
                         help="omit non-English boot translations and French, German, Italian, Spanish and Swedish Essentials packages and receipts")
+    parser.add_argument("--remove-ps2", action="store_true",
+                        help="remove PS/2 keyboard and mouse drivers from the boot image and installed system")
     parser.add_argument("--beta-disk", type=Path,
                         help="beta-driver floppy (required unless --bus-master-ide is provided)")
     parser.add_argument("--bus-master-ide", type=Path, metavar="PACKAGE",
@@ -383,7 +399,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               user_cd=args.user_cd, output=args.output, iso_tool=args.iso_tool, nextufs_binary=args.nextufs,
               bus_master_ide=args.bus_master_ide, fix_pic_bug=args.fix_pic_bug, developer_cd=args.developer_cd,
               user_patch=args.user_patch, developer_patch=args.developer_patch,
-              remove_languages=args.remove_languages, setup_app=args.setup_app,
+              remove_languages=args.remove_languages, remove_ps2=args.remove_ps2, setup_app=args.setup_app,
               profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package,
               framebuffer_wc=args.framebuffer_wc, installation_drivers=args.installation_driver,
               usb=args.usb)
