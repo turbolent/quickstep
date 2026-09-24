@@ -34,6 +34,13 @@ python3 build.py \
   --output openstep.iso
 ```
 
+Installation limits the OPENSTEP area to **4 GiB (4096 MB in the installer)**.
+On larger drives, erase mode removes all existing partitions and uses a prepared layout,
+leaving the remainder unallocated.
+It bypasses fdisk's BIOS geometry check while keeping the executable unchanged.
+OPENSTEP keeps its normal subdivision into filesystem volumes within that area.
+Advanced partitioning still uses stock fdisk.
+
 ### Optional flags
 
 - `--usb`: create a raw USB disk image instead of the default CD ISO (see below).

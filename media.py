@@ -31,8 +31,8 @@ __all__ = [
     "DriverImage", "MediaError", "PathInput", "DiskLabel", "FilesystemInfo", "ImageInfo", "IsoLayout",
     "nextufs", "new_output", "resolve_iso_tool", "image_info", "cd_layout", "extract_ufs", "grow_image",
     "check_image", "pad_image", "copy_kernel", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
-    "prepare_installation_drivers", "verify_boot_cd",
-    "UsbLayout", "prepare_usb_installer", "create_usb", "usb_layout", "verify_boot_usb",
+    "prepare_installation_drivers", "prepare_installer_disks", "verify_boot_cd",
+    "UsbLayout", "create_usb", "usb_layout", "verify_boot_usb",
     "skip_boot_language_selection",
     "remove_boot_languages",
     "remove_language_packages", "patch_builddisk_language_heading", "patch_builddisk_capacity",
@@ -1787,13 +1787,13 @@ _USB_SYSTEM_TABLE = ROOT + "/System.config/Instance0.table"
 
 
 def _patch_usb_installer(script: bytes) -> bytes:
-    fdisk = b"${FDISK} $livedisk"
-    selection = b"diskie=`${PICKDISK} ${disknum}`\n"
-    if script.count(selection) != 1 or script.count(fdisk) != 9 or b"# BEGIN quickstep USB" in script:
+    selection = b"diskie=`${PICKDISK} ${disknum}` || exit 1\n"
+    fdisk = b'    ${QUICKSTEP_FDISK} "$@"\n'
+    if script.count(selection) != 1 or script.count(fdisk) != 1 or b"# BEGIN quickstep USB" in script:
         raise ValueError("unsupported USB installer script")
-    # fdisk otherwise indexes BIOS geometry by the OS device number. Booting
-    # USB as BIOS disk zero makes that geometry belong to the source stick.
-    script = script.replace(fdisk, fdisk + b" -useAllSectors")
+    # USB and destination disks can have different BIOS and OS device numbers.
+    # Preserve the CD's native options; only USB requests all device sectors.
+    script = script.replace(fdisk, b'    ${QUICKSTEP_FDISK} "$@" -useAllSectors\n')
     return script.replace(selection, selection + b'''
 # BEGIN quickstep USB source protection
 source_disk=`${FINDROOT} | ${SED} 's/b$/a/'`
@@ -1805,19 +1805,28 @@ fi
 ''')
 
 
-def prepare_usb_installer(ufs: PathInput, output: PathInput, *,
-                          nextufs_binary: PathInput | None = None) -> None:
-    """Prepare USB destination selection without changing the installed system."""
+def prepare_installer_disks(ufs: PathInput, output: PathInput, *, usb: bool = False,
+                            nextufs_binary: PathInput | None = None) -> None:
+    """Prepare checked CD/USB destination selection and a bounded erase layout."""
+    import installer
+
     with new_output(output, source=ufs) as staged:
         image = Image(executable(nextufs_binary), staged)
         path = "/private/etc/rc.cdrom"
         entry = image.inspect(path)[0]
         parent = image.inspect("/private/etc")[0]
-        expected = _patch_usb_installer(image.read(path, entry))
+        expected = installer.patch_script(image.read(path, entry))
+        if usb:
+            expected = _patch_usb_installer(expected)
+        mbr = installer.limited_layout(image.read("/usr/standalone/i386/boot0"))
+        mbr_entry = replace(entry, mode=stat.S_IFREG | 0o644, size=len(mbr))
+        image.write(installer.MBR_PATH, mbr, mbr_entry, False)
         image.write(path, expected, entry, True)
         image.metadata("/private/etc", parent)
         if image.read(path) != expected:
-            raise ValueError("USB installer script readback differs")
+            raise ValueError("installer script readback differs")
+        if image.read(installer.MBR_PATH) != mbr:
+            raise ValueError("installer partition layout readback differs")
         check_image(staged, nextufs_binary=nextufs_binary)
 
 
@@ -2316,7 +2325,8 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                    ufs: PathInput, iso: PathInput, *, nextufs_binary: PathInput | None = None,
                    installation_drivers: bool = False, fix_pic_bug: bool = False,
                    package_hook: bytes = b"", packaged_drivers: Iterable[str] = (),
-                   kernel_source: PathInput | None = None, removed_drivers: Iterable[str] = ()) -> None:
+                   kernel_source: PathInput | None = None, removed_drivers: Iterable[str] = (),
+                   disk_limits: bool = False) -> None:
     """Check bootloader, El Torito payloads, User UFS, and installer access.
 
     Read-only verification, including fsck of the prepared floppy; this does not
@@ -2325,6 +2335,7 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     of requiring the embedded User UFS to be byte-identical to the original CD.
     kernel_source identifies the independently prepared patched User filesystem;
     omit it to require the original CD and boot-floppy kernels.
+    disk_limits verifies the shared prepared-layout and checked-selection hook.
     """
     boot_disk, boot, user_cd, ufs, iso = map(Path, (boot_disk, boot, user_cd, ufs, iso))
     packaged_drivers = tuple(packaged_drivers)
@@ -2334,12 +2345,13 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     check_payload(iso, layout.ufs_lba, ufs)
     user_layout = cd_layout(user_cd, nextufs_binary=nextufs_binary)
     _check_iso_ufs(iso, layout, _raw_ufs_info(ufs, nextufs_binary), nextufs_binary)
-    if not installation_drivers:
+    if not installation_drivers and not disk_limits:
         check_payload(user_cd, user_layout.slice_base // 2048, ufs)
     _verify_installer(boot, user_cd, iso, nextufs_binary=nextufs_binary,
                       installation_drivers=installation_drivers, fix_pic_bug=fix_pic_bug,
                       package_hook=package_hook, packaged_drivers=packaged_drivers,
-                      kernel_source=kernel_source, removed_drivers=removed_drivers)
+                      kernel_source=kernel_source, removed_drivers=removed_drivers,
+                      disk_limits=disk_limits)
 
 
 def _verify_prepared_boot(boot_disk: Path, boot: Path, nextufs_binary: PathInput | None,
@@ -2387,7 +2399,7 @@ def verify_boot_usb(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     check_image(usb, nextufs_binary=nextufs_binary)
     _verify_installer(boot, user_cd, ufs, nextufs_binary=nextufs_binary,
                       installation_drivers=True, fix_pic_bug=fix_pic_bug, package_hook=package_hook,
-                      packaged_drivers=tuple(packaged_drivers), kernel_source=kernel_source, usb=True,
+                      packaged_drivers=tuple(packaged_drivers), kernel_source=kernel_source, usb=True, disk_limits=True,
                       removed_drivers=removed_drivers)
 
 
@@ -2395,7 +2407,7 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
                       nextufs_binary: PathInput | None, installation_drivers: bool,
                       fix_pic_bug: bool, package_hook: bytes, packaged_drivers: Iterable[str],
                       kernel_source: PathInput | None, usb: bool = False,
-                      removed_drivers: Iterable[str] = ()) -> None:
+                      removed_drivers: Iterable[str] = (), disk_limits: bool = False) -> None:
     """Check installer contents through either the CD view or the raw USB UFS."""
     original_script = nextufs("browse", "--raw", user_cd, "/etc/rc.cdrom", binary=nextufs_binary)
     if installation_drivers:
@@ -2432,8 +2444,18 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
                     raise ValueError(f"unexpected {payload} without fix_pic_bug")
     else:
         expected_script = original_script
-    if usb:
-        expected_script = _patch_usb_installer(expected_script)
+    if disk_limits:
+        import installer
+
+        expected_script = installer.patch_script(expected_script)
+        if usb:
+            expected_script = _patch_usb_installer(expected_script)
+        original_fdisk = nextufs("browse", "--raw", kernel_source or user_cd, "/usr/etc/fdisk", binary=nextufs_binary)
+        if nextufs("browse", "--raw", iso, "/usr/etc/fdisk", binary=nextufs_binary) != original_fdisk:
+            raise ValueError("installer changed the native fdisk executable")
+        boot0 = nextufs("browse", "--raw", iso, "/usr/standalone/i386/boot0", binary=nextufs_binary)
+        if nextufs("browse", "--raw", iso, installer.MBR_PATH, binary=nextufs_binary) != installer.limited_layout(boot0):
+            raise ValueError("installer partition layout differs")
     installer = nextufs("browse", "--raw", iso, "/etc/rc.cdrom", binary=nextufs_binary)
     if installer != expected_script:
         raise ValueError("installer script differs from the prepared installation hook")

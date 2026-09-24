@@ -10,7 +10,7 @@ import media
 import pkg
 from media import PathInput
 
-# Recipe choices: edit these and install_drivers() to build a different CD.
+# Recipe choices: edit these and install_drivers() to customize the installation media.
 VOLUME_ID = "OPENSTEP_4_2"
 BOOT_DRIVERS = ("PS2Keyboard", "EISABus", "PCIBus", "Intel824X0", "EIDE")
 PS2_DRIVERS = ("PS2Keyboard", "PS2Mouse")
@@ -311,11 +311,12 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.prepare_setup_app(setup_app, installer, with_setup, catalog=catalog, fix_pic_bug=fix_pic_bug,
                                     nextufs_binary=nextufs_binary)
             installer = with_setup
+        print("Preparing destination disk limits and checked selection...", flush=True)
+        disk_installer = iso.parent / "disk-installer.ufs"
+        media.prepare_installer_disks(installer, disk_installer, usb=usb, nextufs_binary=nextufs_binary)
+        installer = disk_installer
         print(f"Building {'USB image' if usb else 'ISO'}: {output}...", flush=True)
         if usb:
-            usb_installer = iso.parent / "usb-installer.ufs"
-            media.prepare_usb_installer(installer, usb_installer, nextufs_binary=nextufs_binary)
-            installer = usb_installer
             media.create_usb(boot, installer, iso, nextufs_binary=nextufs_binary)
             print("Verifying USB boot files and installer...", flush=True)
             media.verify_boot_usb(boot_disk, boot, user_cd, installer, iso,
@@ -333,7 +334,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.verify_boot_cd(boot_disk, boot, user_cd, installer, iso, nextufs_binary=nextufs_binary,
                                  installation_drivers=True, fix_pic_bug=fix_pic_bug,
                                  package_hook=package_hook, packaged_drivers=packaged_drivers,
-                                 kernel_source=kernel_source, removed_drivers=removed_drivers)
+                                 kernel_source=kernel_source, removed_drivers=removed_drivers, disk_limits=True)
             contents = iso
         if prepared_patch is not None:
             assert kernel_source is not None
@@ -404,7 +405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               framebuffer_wc=args.framebuffer_wc, installation_drivers=args.installation_driver,
               usb=args.usb)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
-        parser.exit(1, f"build_cd.py: {exc}\n")
+        parser.exit(1, f"build.py: {exc}\n")
     return 0
 
 
