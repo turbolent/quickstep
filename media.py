@@ -42,6 +42,8 @@ __all__ = [
     "copy_directory", "verify_directory_copy",
     "copy_tar", "verify_tar_copy", "tar_entries",
     "MAX_GROWN_FLOPPY_KIB", "MAX_BOOT_FLOPPY_KIB",
+    "patch_vbe_cache", "prepare_framebuffer_wc", "configure_framebuffer_wc",
+    "verify_framebuffer_wc", "copy_bootloader",
 ]
 PathInput: TypeAlias = str | os.PathLike[str]
 
@@ -699,6 +701,179 @@ def pad_image(image: PathInput, size_kib: int) -> None:
         if size_kib * 1024 < os.fstat(stream.fileno()).st_size:
             raise ValueError("padding would shrink the image")
         stream.truncate(size_kib * 1024)
+
+
+# Same verified profile as FramebufferWC 0.27's native vbe-cache-patch.
+_VBE_SIZE = 37984
+_VBE_STOCK = "9fbc2cafbdd0124cc63b902161c86bbfec0ef48d591dda681a325ff7b68daded"
+_VBE_PATCHED = "cdc925ec0ffbb0d5524540086aea3491875170a26aafd2648f047a2000af91ae"
+_VBE_PATCHES = (
+    (0x0b80, bytes.fromhex("0f b7 05 58 28 01"), bytes.fromhex("83 4e 60 04 eb 20")),
+    (0x0cac, bytes.fromhex("8b 4c 18 04 51 8b 1c 18 53 8b"),
+     bytes.fromhex("83 4c 18 60 04 83 c4 14 eb 27")),
+)
+_WC_DRIVERS = ("VBE20DisplayDriver", "FramebufferWC")
+_VBE_BINARY = ROOT + "/VBE20DisplayDriver.config/VBE20DisplayDriver_reloc"
+
+
+def patch_vbe_cache(binary: bytes) -> bytes:
+    """Apply the known VBE copy-back patch; refuse every other binary."""
+    digest = hashlib.sha256(binary).hexdigest()
+    if len(binary) != _VBE_SIZE or digest not in (_VBE_STOCK, _VBE_PATCHED):
+        raise ValueError("unrecognized VBE binary for framebuffer write combining")
+    patched = digest == _VBE_PATCHED
+    result = bytearray(binary)
+    for offset, stock, replacement in _VBE_PATCHES:
+        if binary[offset:offset + len(stock)] != (replacement if patched else stock):
+            raise ValueError("unexpected VBE patch-site bytes")
+        result[offset:offset + len(stock)] = replacement
+    if hashlib.sha256(result).hexdigest() != _VBE_PATCHED:
+        raise ValueError("patched VBE hash verification failed")
+    return bytes(result)
+
+
+def configure_framebuffer_wc(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Configure VBE and WC as consecutive boot drivers, preserving other settings."""
+    with transaction(Image(executable(nextufs_binary), image)) as target:
+        for name in _WC_DRIVERS:
+            _configure(target, name, "Default.table", False, {"Boot Driver": "Yes"})
+            path = target.bundle(name) + "/Instance0.table"
+            entry = target.inspect(path)[0]
+            data = target.read(path, entry)
+            # Match DriverImage.store and the native Setup helper: NXStringTable
+            # cannot read CR line endings in a runtime instance table.
+            normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if normalized != data:
+                target.write(path, normalized, entry, True)
+        path, table = system_table(target)
+        boot, active = driver_lists(table)
+        preceding = boot[:boot.index(_WC_DRIVERS[0])] if _WC_DRIVERS[0] in boot else boot
+        position = sum(name not in _WC_DRIVERS for name in preceding)
+        boot = [name for name in boot if name not in _WC_DRIVERS]
+        boot[position:position] = _WC_DRIVERS
+        table.set("Boot Drivers", " ".join(boot))
+        table.set("Active Drivers", " ".join(name for name in active if name not in _WC_DRIVERS))
+        table.set("Boot Graphics", "Yes")
+        target.write(path, table.data().replace(b"\r\n", b"\n").replace(b"\r", b"\n"),
+                     target.inspect(path)[0], True)
+
+
+def prepare_framebuffer_wc(user_ufs: PathInput, output: PathInput, *,
+                           nextufs_binary: PathInput | None = None) -> None:
+    """Prepare runtime CD drivers after Patch 4 and the WC package are installed.
+
+    Keep the package at /private/Devices for native receipt/BOM installation;
+    the CD itself loads drivers from /private/Drivers/i386. No guest executable
+    is run on the host. Retain the exact stock VBE backup for Setup's patcher.
+    """
+    binary = executable(nextufs_binary)
+    with new_output(output) as staged:
+        copy_directory(user_ufs, "/private/Devices/FramebufferWC.config", user_ufs,
+                       ROOT + "/FramebufferWC.config", staged, nextufs_binary=binary)
+        image = Image(binary, staged)
+        entry = image.inspect(_VBE_BINARY)[0]
+        original = image.read(_VBE_BINARY, entry)
+        patched = patch_vbe_cache(original)
+        backup = image.child(ROOT + "/VBE20DisplayDriver.config", "VBE20DisplayDriver_reloc.stock")
+        if backup is not None:
+            stock = image.read(_VBE_BINARY + ".stock", backup)
+            if len(stock) != _VBE_SIZE or hashlib.sha256(stock).hexdigest() != _VBE_STOCK:
+                raise ValueError("invalid stock VBE backup")
+        elif original == patched:
+            raise ValueError("already-patched VBE requires a verified stock backup")
+        else:
+            image.write(_VBE_BINARY + ".stock", original, entry, exists=False)
+        image.write(_VBE_BINARY, patched, entry, exists=True)
+        configure_framebuffer_wc(staged, nextufs_binary=binary)
+        verify_framebuffer_wc(staged, nextufs_binary=binary)
+        check_image(staged, nextufs_binary=binary)
+
+
+def verify_framebuffer_wc(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Verify the patched driver, native backup, instances and required load order."""
+    target = Image(executable(nextufs_binary), image)
+    for suffix, digest in (("", _VBE_PATCHED), (".stock", _VBE_STOCK)):
+        data = target.read(_VBE_BINARY + suffix)
+        if len(data) != _VBE_SIZE or hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError("VBE binary or stock backup verification failed")
+    for name in _WC_DRIVERS:
+        if not target.read(target.bundle(name) + "/" + name + "_reloc"):
+            raise ValueError(f"missing {name} driver binary")
+        if not Table(target.read(target.bundle(name) + "/Instance0.table")).is_boot():
+            raise ValueError(f"{name} must be a boot driver")
+    _, system = system_table(target)
+    boot, active = driver_lists(system)
+    if (any(boot.count(name) != 1 or name in active for name in _WC_DRIVERS) or
+            boot.index(_WC_DRIVERS[1]) != boot.index(_WC_DRIVERS[0]) + 1):
+        raise ValueError("FramebufferWC must immediately follow VBE in Boot Drivers")
+    if system.get("Boot Graphics") != "Yes":
+        raise ValueError("framebuffer media requires graphical boot")
+
+
+_FLOPPY_LABELS = (7680, 15360, 23040)
+_FLOPPY_OLD_FRONT = 64 * 1024
+_FLOPPY_WC_FRONT = 80 * 1024
+_FLOPPY_LOADER_OFFSET = 32 * 1024
+_FLOPPY_LOADER_LIMIT = 88 * 512
+_FLOPPY_FIRST_SHA256 = "b62b0a4ce0e5f4230a5a13268b79287c1a27006c08404cc8bb12a9e99440be14"
+_PATCH4_BOOT_SHA256 = "925d35b683644cda6c090b223b00c115f1c83116d466f230b71231b7ab75cbce"
+
+
+def _framebuffer_bootloader(source: PathInput, binary: PathInput | None) -> bytes:
+    image = Image(executable(binary), source)
+    loader = image.read("/usr/standalone/i386/boot")
+    if (not 0 < len(loader) <= _FLOPPY_LOADER_LIMIT or
+            hashlib.sha256(loader).hexdigest() != _PATCH4_BOOT_SHA256):
+        raise ValueError("expected the VBE-capable Patch 4 bootloader within the floppy load limit")
+    return loader
+
+
+def _floppy_labels(data: bytes, front: int) -> None:
+    if hashlib.sha256(data[:512]).hexdigest() != _FLOPPY_FIRST_SHA256:
+        raise ValueError("unsupported floppy first-stage bootloader")
+    for offset in _FLOPPY_LABELS:
+        label = data[offset:offset + 0x300]
+        if (len(label) != 0x300 or label[:4] != b"dlV3" or
+                struct.unpack_from(">I", label, 4)[0] != offset // 512 or
+                struct.unpack_from(">I", label, 0x5c)[0] != 1024 or
+                struct.unpack_from(">H", label, 0x70)[0] != front // 1024 or
+                struct.unpack_from(">II", label, 0x7c) != (32, 0xffffffff) or
+                label[0xbc:0xbe] != b"ab" or struct.unpack_from(">i", label, 0xbe)[0] != 0 or
+                struct.unpack_from(">H", label, 0x22e)[0] != _usb_checksum(label)):
+            raise ValueError("unsupported or corrupt native floppy label")
+
+
+def copy_bootloader(source_image: PathInput, target_image: PathInput, output: PathInput, *,
+                    nextufs_binary: PathInput | None = None) -> None:
+    """Relocate a prepared floppy's UFS and install Patch 4's larger bootloader."""
+    loader = _framebuffer_bootloader(source_image, nextufs_binary)
+    original = Path(target_image).read_bytes()
+    _floppy_labels(original, _FLOPPY_OLD_FRONT)
+    info = image_info(target_image, nextufs_binary=nextufs_binary)
+    if (info.slice_base != _FLOPPY_OLD_FRONT or not info.used_disk_label or
+            info.filesystem_bytes != info.slice_bytes or info.trailing_slice_slack != 0 or
+            info.slice_base + info.slice_bytes != len(original)):
+        raise ValueError("expected an unpadded native boot floppy")
+    delta = _FLOPPY_WC_FRONT - _FLOPPY_OLD_FRONT
+    if len(original) + delta > MAX_BOOT_FLOPPY_KIB * 1024:
+        raise ValueError("relocated floppy exceeds the boot image size limit")
+    header = bytearray(original[:_FLOPPY_OLD_FRONT] + bytes(delta))
+    for offset in _FLOPPY_LABELS:
+        struct.pack_into(">H", header, offset + 0x70, _FLOPPY_WC_FRONT // 1024)
+        struct.pack_into(">H", header, offset + 0x22e, _usb_checksum(header[offset:offset + 0x300]))
+    header[_FLOPPY_LOADER_OFFSET:_FLOPPY_LOADER_OFFSET + _FLOPPY_LOADER_LIMIT] = \
+        loader.ljust(_FLOPPY_LOADER_LIMIT, b"\0")
+    _floppy_labels(header, _FLOPPY_WC_FRONT)
+    with new_output(output) as staged:
+        staged.write_bytes(header + original[_FLOPPY_OLD_FRONT:])
+        relocated = image_info(staged, nextufs_binary=nextufs_binary)
+        if relocated.slice_base != _FLOPPY_WC_FRONT or relocated.filesystem != info.filesystem:
+            raise ValueError("boot filesystem relocation verification failed")
+        with staged.open("rb") as stream:
+            stream.seek(_FLOPPY_WC_FRONT)
+            if stream.read() != original[_FLOPPY_OLD_FRONT:]:
+                raise ValueError("boot filesystem changed during relocation")
+        check_image(staged, nextufs_binary=nextufs_binary)
 
 
 @dataclass(frozen=True)
@@ -2326,7 +2501,7 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                    installation_drivers: bool = False, fix_pic_bug: bool = False,
                    package_hook: bytes = b"", packaged_drivers: Iterable[str] = (),
                    kernel_source: PathInput | None = None, removed_drivers: Iterable[str] = (),
-                   disk_limits: bool = False) -> None:
+                   disk_limits: bool = False, bootloader_source: PathInput | None = None) -> None:
     """Check bootloader, El Torito payloads, User UFS, and installer access.
 
     Read-only verification, including fsck of the prepared floppy; this does not
@@ -2335,11 +2510,12 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     of requiring the embedded User UFS to be byte-identical to the original CD.
     kernel_source identifies the independently prepared patched User filesystem;
     omit it to require the original CD and boot-floppy kernels.
+    bootloader_source permits only the checked Patch 4 loader and floppy relocation.
     disk_limits verifies the shared prepared-layout and checked-selection hook.
     """
     boot_disk, boot, user_cd, ufs, iso = map(Path, (boot_disk, boot, user_cd, ufs, iso))
     packaged_drivers = tuple(packaged_drivers)
-    _verify_prepared_boot(boot_disk, boot, nextufs_binary, fix_pic_bug, kernel_source)
+    _verify_prepared_boot(boot_disk, boot, nextufs_binary, fix_pic_bug, kernel_source, bootloader_source)
     layout = iso_layout(iso)
     check_payload(iso, layout.boot_lba, boot)
     check_payload(iso, layout.ufs_lba, ufs)
@@ -2355,14 +2531,32 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
 
 
 def _verify_prepared_boot(boot_disk: Path, boot: Path, nextufs_binary: PathInput | None,
-                          fix_pic_bug: bool, kernel_source: PathInput | None) -> None:
+                          fix_pic_bug: bool, kernel_source: PathInput | None,
+                          bootloader_source: PathInput | None = None) -> None:
     with boot_disk.open("rb") as source, boot.open("rb") as prepared:
-        original, grown = source.read(65536), prepared.read(65536)
+        original, grown = source.read(65536), prepared.read(_FLOPPY_WC_FRONT if bootloader_source else 65536)
     if len(original) != 65536 or boot.stat().st_size != MAX_BOOT_FLOPPY_KIB * 1024:
         raise ValueError(f"expected an original boot floppy and a {MAX_BOOT_FLOPPY_KIB} KiB boot image")
-    # Resizing may update the three disk labels, but not the bootloader between them.
+    if bootloader_source is not None:
+        _floppy_labels(original, _FLOPPY_OLD_FRONT)
+        _floppy_labels(grown, _FLOPPY_WC_FRONT)
+        info = image_info(boot, nextufs_binary=nextufs_binary)
+        if info.slice_base != _FLOPPY_WC_FRONT or info.filesystem_bytes != info.slice_bytes:
+            raise ValueError("incorrect relocated boot filesystem extent")
+        expected = bytearray(original + bytes(_FLOPPY_WC_FRONT - len(original)))
+        for offset in _FLOPPY_LABELS:
+            struct.pack_into(">H", expected, offset + 0x70, _FLOPPY_WC_FRONT // 1024)
+            struct.pack_into(">I", expected, offset + 0xc2, info.slice_bytes // 1024)
+            struct.pack_into(">H", expected, offset + 0x22e, _usb_checksum(expected[offset:offset + 0x300]))
+        loader = _framebuffer_bootloader(bootloader_source, nextufs_binary)
+        expected[_FLOPPY_LOADER_OFFSET:_FLOPPY_LOADER_OFFSET + _FLOPPY_LOADER_LIMIT] = \
+            loader.ljust(_FLOPPY_LOADER_LIMIT, b"\0")
+        if grown != expected:
+            raise ValueError("bootloader bytes or relocated disk labels differ")
+    # Without an explicit replacement, resizing may only update disk labels.
     for offset, (old, new) in enumerate(zip(original, grown)):
-        if old != new and not any(label <= offset < label + 0x300 for label in (7680, 15360, 23040)):
+        if (bootloader_source is None and old != new and
+                not any(label <= offset < label + 0x300 for label in _FLOPPY_LABELS)):
             raise ValueError("bootloader bytes changed")
     expected_boot = nextufs("browse", "--raw", kernel_source or boot_disk, "/mach_kernel", binary=nextufs_binary)
     expected_boot = _i386_kernel(expected_boot)
@@ -2377,9 +2571,9 @@ def verify_boot_usb(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                     ufs: PathInput, usb: PathInput, *, nextufs_binary: PathInput | None = None,
                     fix_pic_bug: bool = False, package_hook: bytes = b"",
                     packaged_drivers: Iterable[str] = (), kernel_source: PathInput | None = None,
-                    removed_drivers: Iterable[str] = ()) -> None:
+                    removed_drivers: Iterable[str] = (), bootloader_source: PathInput | None = None) -> None:
     """Verify native boot stages, prepared boot files, and installer UFS b."""
-    _verify_prepared_boot(Path(boot_disk), Path(boot), nextufs_binary, fix_pic_bug, kernel_source)
+    _verify_prepared_boot(Path(boot_disk), Path(boot), nextufs_binary, fix_pic_bug, kernel_source, bootloader_source)
     layout = usb_layout(usb)
     if layout.installer_bytes != _raw_ufs_info(ufs, nextufs_binary).filesystem_bytes:
         raise ValueError("USB installer partition size differs from prepared UFS")

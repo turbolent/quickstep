@@ -43,7 +43,8 @@ SETUP_CATALOG = media.SetupCatalog(
 def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInput | None,
                     stage: Path, *, nextufs_binary: PathInput | None = None,
                     installation_driver_bundles: Sequence[PathInput] = (),
-                    use_bus_master_ide: bool = False, remove_ps2: bool = False) -> None:
+                    use_bus_master_ide: bool = False, remove_ps2: bool = False,
+                    framebuffer_wc: bool = False) -> None:
     """Prepare the boot drivers through the root media.py library only."""
     bundles: dict[str, Path] = {}
     for bundle in map(Path, installation_driver_bundles):
@@ -123,6 +124,9 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
         "Driver Disk Prompts": "0",
         "Installation Driver Families": "Disk",
     })
+    if framebuffer_wc:
+        media.configure_framebuffer_wc(image, nextufs_binary=nextufs_binary)
+        media.verify_framebuffer_wc(image, nextufs_binary=nextufs_binary)
 
 
 def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | None,
@@ -130,7 +134,7 @@ def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput |
             installation_driver_bundles: Sequence[PathInput] = (),
             use_bus_master_ide: bool = False, remove_languages: bool = False,
             remove_ps2: bool = False,
-            kernel_source: PathInput | None = None) -> None:
+            kernel_source: PathInput | None = None, bootloader_source: PathInput | None = None) -> None:
     """Make a grown, driver-equipped copy; publish only after every step succeeds."""
     print(f"Copying boot floppy from {boot_disk}...", flush=True)
     with media.new_output(output, source=boot_disk) as image:
@@ -148,7 +152,13 @@ def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput |
             with_kernel.replace(image)
         install_drivers(image, driver_disk, beta_disk, image.parent, nextufs_binary=nextufs_binary,
                         installation_driver_bundles=installation_driver_bundles,
-                        use_bus_master_ide=use_bus_master_ide, remove_ps2=remove_ps2)
+                        use_bus_master_ide=use_bus_master_ide, remove_ps2=remove_ps2,
+                        **({"framebuffer_wc": True} if bootloader_source is not None else {}))
+        if bootloader_source is not None:
+            print("Installing VBE-capable Patch 4 floppy bootloader...", flush=True)
+            relocated = image.parent / "boot-vbe.img"
+            media.copy_bootloader(bootloader_source, image, relocated, nextufs_binary=nextufs_binary)
+            relocated.replace(image)
         print("Checking boot-floppy filesystem (fsck)...", flush=True)
         media.check_image(image, nextufs_binary=nextufs_binary)
         print(f"Padding boot floppy to {media.MAX_BOOT_FLOPPY_KIB} KiB...", flush=True)
@@ -167,6 +177,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
     """Build and check installation media; publish only after all checks pass."""
     if usb and iso_tool is not None:
         raise ValueError("--iso-tool cannot be used with --usb")
+    if framebuffer_wc is not None and user_patch is None:
+        raise ValueError("--framebuffer-wc requires --user-patch")
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
     print("Checking input paths and build tools...", flush=True)
@@ -247,6 +259,9 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             if any(item.name == installed.name or item.package.name == installed.package.name
                    for item in installed_drivers):
                 raise ValueError(f"duplicate installation driver or package: {installed.name}")
+            if framebuffer_wc is not None and (installed.name in ("VBE20DisplayDriver", "FramebufferWC") or
+                                                installed.package.name == "FramebufferWC"):
+                raise ValueError(f"duplicate installation driver or package with --framebuffer-wc: {installed.name}")
             if bus_master_ide is not None and installed.name == "EIDE":
                 raise ValueError("an EIDE installation driver conflicts with --bus-master-ide")
             if remove_ps2 and installed.name in PS2_DRIVERS:
@@ -258,13 +273,30 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             installed_drivers.append(installed)
             driver_bundles.append(bundle)
             ufs = packaged
+        bootloader_source = None
+        if framebuffer_wc is not None:
+            packaged = iso.parent / "framebuffer-package.ufs"
+            print("Installing FramebufferWC on the CD...", flush=True)
+            installed = pkg.install_driver_package(framebuffer_wc, ufs, packaged, nextufs_binary=nextufs_binary)
+            if installed.name != "FramebufferWC" or installed.package.name != "FramebufferWC":
+                raise ValueError("--framebuffer-wc requires a package containing FramebufferWC.config")
+            installed_drivers.append(installed)
+            print("Patching VBE and activating both framebuffer drivers on the CD...", flush=True)
+            ufs = iso.parent / "framebuffer.ufs"
+            media.prepare_framebuffer_wc(packaged, ufs, nextufs_binary=nextufs_binary)
+            for name in ("VBE20DisplayDriver", "FramebufferWC"):
+                bundle = iso.parent / (name + ".config")
+                media.DriverImage(ufs, nextufs=nextufs_binary).extract(name, bundle)
+                driver_bundles.append(bundle)
+            bootloader_source = kernel_source
         package_hook += pkg.installation_hook(item.package for item in installed_drivers)
         packaged_drivers = tuple(item.name for item in installed_drivers)
         removed_drivers = PS2_DRIVERS if remove_ps2 else ()
         print(f"Preparing boot floppy and drivers from {boot_disk}...", flush=True)
         drivers(boot_disk, driver_disk, beta_disk, boot, nextufs_binary=nextufs_binary,
                 installation_driver_bundles=driver_bundles, use_bus_master_ide=bus_master_ide is not None,
-                remove_languages=remove_languages, remove_ps2=remove_ps2, kernel_source=kernel_source)
+                remove_languages=remove_languages, remove_ps2=remove_ps2, kernel_source=kernel_source,
+                **({"bootloader_source": bootloader_source} if bootloader_source is not None else {}))
         if remove_languages:
             print("Removing optional non-English language packages and receipts...", flush=True)
             pruned = iso.parent / "english.ufs"
@@ -322,7 +354,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.verify_boot_usb(boot_disk, boot, user_cd, installer, iso,
                                   nextufs_binary=nextufs_binary, fix_pic_bug=fix_pic_bug,
                                   package_hook=package_hook, packaged_drivers=packaged_drivers,
-                                  kernel_source=kernel_source, removed_drivers=removed_drivers)
+                                  kernel_source=kernel_source, removed_drivers=removed_drivers,
+                                  bootloader_source=bootloader_source)
             # verify_boot_usb checks partition b against this UFS, allowing only
             # the superblock conversion to the USB label's logical block size.
             # nextufs's default whole-disk view selects the boot partition a.
@@ -334,8 +367,11 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.verify_boot_cd(boot_disk, boot, user_cd, installer, iso, nextufs_binary=nextufs_binary,
                                  installation_drivers=True, fix_pic_bug=fix_pic_bug,
                                  package_hook=package_hook, packaged_drivers=packaged_drivers,
-                                 kernel_source=kernel_source, removed_drivers=removed_drivers, disk_limits=True)
+                                 kernel_source=kernel_source, removed_drivers=removed_drivers, disk_limits=True,
+                                 bootloader_source=bootloader_source)
             contents = iso
+        if framebuffer_wc is not None:
+            media.verify_framebuffer_wc(contents, nextufs_binary=nextufs_binary)
         if prepared_patch is not None:
             assert kernel_source is not None
             media.verify_directory_copy(kernel_source, prepared_patch.receipt_source, contents,
@@ -379,7 +415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--optional-driver-package", type=Path, action="append", default=[], metavar="PACKAGE",
                         help=".pkg directory or single-package tar to include in Setup (repeatable)")
     parser.add_argument("--framebuffer-wc", type=Path, metavar="PACKAGE",
-                        help="FramebufferWC package to include in Setup; requires User Patch 4 and patches VBE after installation")
+                        help="install patched VBE and FramebufferWC on boot media and startup disk; requires --user-patch; retain Setup repair choice")
     parser.add_argument("--fix-pic-bug", action="store_true",
                         help="apply the PIC interrupt fix to the boot and installed kernels")
     parser.add_argument("--remove-languages", action="store_true",

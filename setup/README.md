@@ -6,6 +6,7 @@ Run Setup as root; it launches Installer directly with the same privileges.
 Complete each installation, then quit Installer to continue with the next package.
 When enabled, it reapplies the PIC kernel fix after User Patch 4.
 For FramebufferWC, it waits for successful User Patch 4 and driver receipts and for Installer to close, then patches VBE and activates both drivers.
+Media built with `--framebuffer-wc` already installs and activates both drivers. The retained Setup choice can repair their patch and activation later, using the stock VBE backup supplied by the build.
 The helper uses OPENSTEP's stock shell and `awk`.
 Existing driver instance tables are never replaced; rerunning Setup preserves the configured VBE mode and other settings.
 Post-install commands are configured in the catalog, run as root from the CD root, and log their output to Setup's log.

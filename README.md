@@ -59,18 +59,22 @@ Advanced partitioning still uses stock fdisk.
 - `--developer-cd /path/to/Developer.iso`: include the Developer CD packages.
 - `--user-patch /path/to/OS42MachUserPatch4.tar`: apply User Patch 4 to the CD filesystem and boot-floppy kernel, and install it automatically on the startup disk.
   The startup disk receives the complete patch, its receipt, and the VBE-enabled bootloader.
-  The CD's existing bootloader is retained; the original package is also included for use on other systems.
+  The CD's existing bootloader is retained unless `--framebuffer-wc` is also supplied; the original package is included for use on other systems.
 - `--developer-patch /path/to/OS42MachDevPatch4.tar`: include Developer Patch 4.
 - `--profile-libs-patch /path/to/OS42MachPLibPatch4.tar`: include Profiling Libraries Patch 4.
 - `--setup-app /path/to/Setup.app`: include the native post-installation package selector (see [building Setup.app](setup/README.md)).
 - `--optional-driver-package /path/to/Driver.pkg`: copy an optional driver package to `/NextCD/Packages` and list it under **Drivers** when Setup.app is included.
   Repeat the flag for additional packages; single-package tar archives are also accepted.
   These choices are unchecked by default and do not change the boot-floppy drivers.
-- `--framebuffer-wc ../FramebufferWC/FramebufferWC-0.27.pkg.tar.gz`: include FramebufferWC as an optional **Drivers** choice in Setup.
-  Use with `--setup-app` and `--user-patch` (or an already-installed User Patch 4).
-  Selecting it installs User Patch 4 first if needed, then FramebufferWC, patches VBE, and activates both drivers in load order.
-  Missing driver instances are copied from their default tables; existing instance settings are preserved.
-  Reboot afterward to use the drivers.
+- `--framebuffer-wc ../FramebufferWC/FramebufferWC-0.27.pkg.tar.gz`: install patched VBE and FramebufferWC on the boot floppy, CD/USB filesystem, and startup disk automatically.
+  Requires `--user-patch`; `--setup-app` is optional.
+  Both generated driver instances have `Boot Driver = Yes`, with FramebufferWC immediately after VBE in `Boot Drivers`.
+  Other instance settings, including the VBE mode, are preserved; missing instances use their defaults.
+  The exact supported VBE binary is patched before copying it to the floppy, and a verified `.stock` backup is retained for repair/restoration.
+  CD boot uses Patch 4's VBE-capable bootloader and graphical boot. The floppy filesystem moves from 64 KiB to 80 KiB to accommodate that loader, within the same 2.88 MiB boot image.
+  USB uses its existing native boot layout with the Patch 4 bootloader.
+  The original FramebufferWC package remains available on the CD, and Setup retains its optional **Drivers** repair action.
+  Do not also supply VBE or FramebufferWC through `--installation-driver`.
 - `--remove-languages`: remove non-English boot-floppy translations and additional language packages and their receipt entries from the generated CD.
   English and existing localized files in the base system are retained.
 - `--remove-ps2`: remove `PS2Keyboard` and `PS2Mouse` from the boot image and installed system, including their activation entries.
@@ -82,7 +86,7 @@ Advanced partitioning still uses stock fdisk.
   This option cannot be combined with `--usb`.
 
 Developer packages, Developer Patch 4, and Profiling Libraries Patch 4 are copied to `/NextCD/Packages` for manual installation with Installer.app after setup.
-Only User Patch 4 is applied automatically when supplied.
+User Patch 4 and FramebufferWC are applied automatically when their flags are supplied.
 With `--fix-pic-bug`, the PIC fix is applied after Patch 4 to both the boot and installed kernels.
 Manually reinstalling User Patch 4 replaces the installed kernel.
 If you built with `--fix-pic-bug`, run `/usr/bin/fix-pic-bug` as root after installing the patch and before rebooting.
@@ -108,6 +112,7 @@ enter `-a` at the `boot:` prompt, then select its installer partition, such as
 
 When included, open Setup.app from the mounted CD after booting and configuring the installed system, logged in as root.
 Setup recognizes the automatically installed User Patch 4 receipt and skips reinstalling it.
-FramebufferWC is unchecked by default and is not installed or activated by building or booting the CD.
+FramebufferWC is already installed and activated when built with `--framebuffer-wc`.
+Its Setup choice remains unchecked by default; selecting it reruns the repair action without reinstalling a receipted package.
 If its post-install action fails, Setup offers Retry without reinstalling the package.
 Selecting it again in a later Setup session safely reapplies the patch and activation, including after reinstalling User Patch 4.
