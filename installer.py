@@ -9,15 +9,16 @@ LIMIT_SECTORS = 4 * 1024 * 1024 * 1024 // 512
 LAYOUT_SECTORS = 66
 
 
-def limited_layout(boot0: bytes) -> bytes:
+def limited_layout(boot1: bytes) -> bytes:
     """Prepared MBR and cleared labels for one active NeXT partition below 4 GiB.
 
     Start at LBA 2 (CHS 0/0/3), the same geometry-independent location used for
     our USB source image. The entire NeXT extent ends at the 4 GiB boundary.
+    boot1 can read this table itself, so boot it directly without boot0's menu.
     """
-    if len(boot0) != 512 or boot0[510:] != b'\x55\xaa':
-        raise ValueError('expected a 512-byte OPENSTEP boot0 with MBR signature')
-    mbr = bytearray(boot0)
+    if len(boot1) != 512 or boot1[510:] != b'\x55\xaa' or any(boot1[446:510]):
+        raise ValueError('expected a 512-byte OPENSTEP boot1 with an empty partition table and MBR signature')
+    mbr = bytearray(boot1)
     mbr[446:510] = b'\0' * 64
     mbr[446:454] = bytes.fromhex('80000300a7feffff')
     struct.pack_into('<II', mbr, 454, 2, LIMIT_SECTORS - 2)

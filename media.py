@@ -2053,7 +2053,7 @@ def prepare_installer_disks(ufs: PathInput, output: PathInput, *, usb: bool = Fa
         expected = installer.patch_script(image.read(path, entry))
         if usb:
             expected = _patch_usb_installer(expected)
-        mbr = installer.limited_layout(image.read("/usr/standalone/i386/boot0"))
+        mbr = installer.limited_layout(image.read("/usr/standalone/i386/boot1"))
         mbr_entry = replace(entry, mode=stat.S_IFREG | 0o644, size=len(mbr))
         image.write(installer.MBR_PATH, mbr, mbr_entry, False)
         image.write(path, expected, entry, True)
@@ -2141,11 +2141,10 @@ def _usb_label(layout: UsbLayout, boot_fs: FilesystemInfo, installer_fs: Filesys
 def _usb_bootloaders(ufs: PathInput, binary: PathInput | None) -> dict[str, bytes]:
     image = Image(executable(binary), ufs)
     loaders = {name: image.read("/usr/standalone/i386/" + name)
-               for name in ("boot0", "boot1", "boot")}
-    for name in ("boot0", "boot1"):
-        data = loaders[name]
-        if len(data) != 512 or data[510:] != b"\x55\xaa" or any(data[446:510]):
-            raise ValueError(f"invalid native USB bootloader {name}: expected a 512-byte boot sector with an empty partition table")
+               for name in ("boot1", "boot")}
+    data = loaders["boot1"]
+    if len(data) != 512 or data[510:] != b"\x55\xaa" or any(data[446:510]):
+        raise ValueError("invalid native USB bootloader boot1: expected a 512-byte boot sector with an empty partition table")
     if not 0 < len(loaders["boot"]) <= _USB_LOADER_LIMIT:
         raise ValueError("native USB second-stage bootloader does not fit boot1's load area")
     return loaders
@@ -2303,7 +2302,8 @@ def create_usb(boot: PathInput, ufs: PathInput, output: PathInput, *,
         boot_info = _raw_ufs_info(raw_boot, nextufs_binary)
         layout = _usb_layout_for_sizes(boot_info.filesystem_bytes, installer_info.filesystem_bytes)
         label = _usb_label(layout, boot_info.filesystem, installer_info.filesystem)
-        mbr = bytearray(loaders["boot0"])
+        # boot1 finds the NeXT partition itself; boot0 only adds a menu and bell.
+        mbr = bytearray(loaders["boot1"])
         mbr[446:454] = bytes.fromhex("80000300a7feffff")
         struct.pack_into("<II", mbr, 454, 2, layout.image_bytes // 512 - 2)
         with staged.open("w+b") as target:
@@ -2640,7 +2640,7 @@ def verify_boot_usb(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     _check_extent(usb, layout.installer_offset, ufs, patches=_usb_ufs_patches(ufs))
     loaders = _usb_bootloaders(ufs, nextufs_binary)
     with Path(usb).open("rb") as image:
-        if image.read(446) != loaders["boot0"][:446]:
+        if image.read(446) != loaders["boot1"][:446]:
             raise ValueError("USB MBR boot code differs")
         image.seek(_USB_PARTITION_OFFSET)
         if image.read(512) != loaders["boot1"]:
@@ -2707,8 +2707,8 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
         original_fdisk = nextufs("browse", "--raw", kernel_source or user_cd, "/usr/etc/fdisk", binary=nextufs_binary)
         if nextufs("browse", "--raw", iso, "/usr/etc/fdisk", binary=nextufs_binary) != original_fdisk:
             raise ValueError("installer changed the native fdisk executable")
-        boot0 = nextufs("browse", "--raw", iso, "/usr/standalone/i386/boot0", binary=nextufs_binary)
-        if nextufs("browse", "--raw", iso, installer.MBR_PATH, binary=nextufs_binary) != installer.limited_layout(boot0):
+        boot1 = nextufs("browse", "--raw", iso, "/usr/standalone/i386/boot1", binary=nextufs_binary)
+        if nextufs("browse", "--raw", iso, installer.MBR_PATH, binary=nextufs_binary) != installer.limited_layout(boot1):
             raise ValueError("installer partition layout differs")
     installer = nextufs("browse", "--raw", iso, "/etc/rc.cdrom", binary=nextufs_binary)
     if installer != expected_script:

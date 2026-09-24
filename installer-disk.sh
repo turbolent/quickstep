@@ -1,8 +1,10 @@
 # BEGIN quickstep disk limits
 QUICKSTEP_FDISK=${FDISK}
 QUICKSTEP_PICKDISK=${PICKDISK}
+QUICKSTEP_DISK=${DISK}
 FDISK=quickstep_fdisk
 PICKDISK=quickstep_pickdisk
+DISK=quickstep_disk
 FDISK_FLAGS=
 QUICKSTEP_DISK_LIST=
 QUICKSTEP_FIXED_LAYOUT=no
@@ -29,6 +31,16 @@ quickstep_pickdisk() {
 
 quickstep_fdisk() {
     ${QUICKSTEP_FDISK} "$@"
+}
+
+quickstep_disk() {
+    case "$QUICKSTEP_FIXED_LAYOUT:${1-}" in
+        yes:-i|yes:-b)
+            # Native disk otherwise reinstalls boot0 on partitioned disks.
+            # -B0 replaces the boot code while retaining the partition table.
+            ${QUICKSTEP_DISK} -B0 /usr/standalone/i386/boot1 "$@" ;;
+        *) ${QUICKSTEP_DISK} "$@" ;;
+    esac
 }
 
 quickstep_number() {
