@@ -1515,8 +1515,12 @@ def fix_builddisk_capacity(user_ufs: PathInput, output: PathInput, *,
 def configure_order_installation_hook() -> bytes:
     """Copy the verified executable and its backup beyond the stock BOM filter."""
     return br'''    echo "Installing order-preserving Configure..."
+    # Restore privileges explicitly: cp -p can lose setuid on OPENSTEP.
+    # Set ownership first because chown can clear the setuid bit.
     if ${CP} -p "${ROOT}/NextAdmin/Configure.app/Configure.pre-driver-order" "${HD}/NextAdmin/Configure.app/Configure.pre-driver-order" &&
-        ${CP} -p "${ROOT}/NextAdmin/Configure.app/Configure" "${HD}/NextAdmin/Configure.app/Configure"; then
+        ${CP} -p "${ROOT}/NextAdmin/Configure.app/Configure" "${HD}/NextAdmin/Configure.app/Configure" &&
+        "${ROOT}/usr/etc/chown" root "${HD}/NextAdmin/Configure.app/Configure" "${HD}/NextAdmin/Configure.app/Configure.pre-driver-order" &&
+        ${CHMOD} 4755 "${HD}/NextAdmin/Configure.app/Configure" "${HD}/NextAdmin/Configure.app/Configure.pre-driver-order"; then
         echo "Configure order fix and stock backup installed."
     else
         echo "Cannot install Configure order fix; installation stopped."
@@ -1526,9 +1530,13 @@ def configure_order_installation_hook() -> bytes:
 
 
 def verify_configure_order(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
-    """Require a patched Configure and its exact, recoverable stock backup."""
+    """Require a patched Configure, its stock backup, and root/setuid metadata."""
     target = Image(executable(nextufs_binary), image)
     path = "/NextAdmin/Configure.app/Configure"
+    for name in (path, path + ".pre-driver-order"):
+        entry = target.inspect(name)[0]
+        if entry.uid != 0 or stat.S_IMODE(entry.mode) != 0o4755:
+            raise ValueError(f"{name} must be owned by root with mode 4755 (setuid)")
     backup = target.read(path + ".pre-driver-order")
     patched = patch_configure_order(backup)
     if backup == patched or target.read(path) != patched:
