@@ -1126,7 +1126,7 @@ if [ "${ARCH}" = "i386" ]; then
         echo "Cannot install boot-floppy drivers; installation stopped."
         exit 1
     fi
-@REMOVE_HOOK@    echo "Configuring installed-system drivers..."
+@REMOVE_HOOK@    echo "Configuring installed-system boot settings..."
     SYSTEM_CONFIG="${HD}/usr/Devices/System.config"
     if [ -f "${SYSTEM_CONFIG}/Default.table" ]; then
         # Instance tables take precedence over Default.table when present.
@@ -1147,6 +1147,19 @@ if [ "${ARCH}" = "i386" ]; then
                         removed = "@REMOVED_DRIVERS@"
                         removals = split(removed, excluded, " ")
                         value = ""
+                        flags = ""
+                    }
+                    /^[ \t]*"Kernel Flags"[ \t]*=/ {
+                        split($0, fields, "\"")
+                        total = split(fields[4], options, " ")
+                        flags = ""
+                        for (i = 1; i <= total; i++) {
+                            if (options[i] !~ /^rootdev=/) {
+                                if (flags == "") flags = options[i]
+                                else flags = flags " " options[i]
+                            }
+                        }
+                        next
                     }
                     /^[ \t]*"Boot Drivers"[ \t]*=/ { next }
                     /^[ \t]*"Active Drivers"[ \t]*=/ {
@@ -1169,6 +1182,11 @@ if [ "${ARCH}" = "i386" ]; then
                     }
                     { print }
                     END {
+                        # pickdisk selects destination partition a.
+                        # Refuse to publish settings without a valid device.
+                        if (root_device !~ /^(sd|hd)[0-9]+a$/) exit 1
+                        if (flags != "") flags = flags " "
+                        printf "\"Kernel Flags\" = \"%srootdev=%s\";\n", flags, root_device
                         if (added != "") {
                             if (value == "") value = added
                             else value = value " " added
@@ -1176,11 +1194,11 @@ if [ "${ARCH}" = "i386" ]; then
                         printf "\"Active Drivers\" = \"%s\";\n", value
                         printf "\"Boot Drivers\" = \"%s\";\n", boot
                     }
-                    ' "${TABLE_FILE}" > "${TABLE_FILE}.quickstep" &&
+                    ' root_device="${diskie}" "${TABLE_FILE}" > "${TABLE_FILE}.quickstep" &&
                     ${MV} "${TABLE_FILE}.quickstep" "${TABLE_FILE}"; then
-                    echo "Configured boot drivers in ${TABLE_FILE}."
+                    echo "Configured boot settings in ${TABLE_FILE}."
                 else
-                    echo "Cannot configure boot drivers in ${TABLE_FILE}; installation stopped."
+                    echo "Cannot configure boot settings in ${TABLE_FILE}; installation stopped."
                     exit 1
                 fi
             fi
@@ -1307,6 +1325,8 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     Merge packaged active drivers in their floppy order, retaining other active
     drivers and removing duplicates of the added names.
     Update Default.table and any instance tables; do not copy CD-boot settings.
+    Set rootdev to the selected destination, preserving other kernel flags,
+    so installed-system booting does not depend on BIOS device classification.
     With fix_pic_bug, derive the installed kernel from the User CD, not the boot
     floppy. Stage a thin, patched copy for rc.cdrom to install after ditto's
     base-system copy; leave the CD's original /mach_kernel untouched.
