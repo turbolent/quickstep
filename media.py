@@ -33,7 +33,7 @@ __all__ = [
     "nextufs", "new_output", "resolve_iso_tool", "image_info", "cd_layout", "extract_ufs", "grow_image",
     "check_image", "pad_image", "copy_kernel", "patch_pic_kernel", "patch_kernel_pic_bug", "create_iso", "iso_layout", "check_payload",
     "prepare_installation_drivers", "prepare_installer_disks", "verify_boot_cd",
-    "UsbLayout", "create_usb", "usb_layout", "verify_boot_usb",
+    "UsbLayout", "prepare_usb_filesystem", "create_usb", "usb_layout", "verify_boot_usb",
     "skip_boot_language_selection",
     "remove_boot_languages",
     "remove_language_packages", "patch_builddisk_language_heading", "patch_builddisk_capacity",
@@ -2027,6 +2027,7 @@ _USB_LOADER_OFFSETS = (32 * 1024, 96 * 1024)
 _USB_LABEL_OFFSETS = (7680, 15360, 23040)
 _USB_LOADER_LIMIT = 44 * 1024  # boot1's fixed second-stage read size.
 _USB_SYSTEM_TABLE = ROOT + "/System.config/Instance0.table"
+_USB_KERNEL = "/NextCD/boot_kernel"
 
 
 def _patch_usb_installer(script: bytes) -> bytes:
@@ -2039,7 +2040,7 @@ def _patch_usb_installer(script: bytes) -> bytes:
     script = script.replace(fdisk, b'    ${QUICKSTEP_FDISK} "$@" -useAllSectors\n')
     return script.replace(selection, selection + b'''
 # BEGIN quickstep USB source protection
-source_disk=`${FINDROOT} | ${SED} 's/b$/a/'`
+source_disk=`${FINDROOT}` || exit 1
 if [ "/dev/${diskie}" = "${source_disk}" ]; then
     echo "The selected disk is the USB installation source. Restart and select a destination disk."
     exit 1
@@ -2075,27 +2076,22 @@ def prepare_installer_disks(ufs: PathInput, output: PathInput, *, usb: bool = Fa
 
 @dataclass(frozen=True)
 class UsbLayout:
-    """Byte offsets in a whole USB disk, not relative to its MBR partition."""
+    """The single bootable installer UFS extent, relative to the whole USB disk."""
 
     image_bytes: int
-    boot_offset: int
-    boot_bytes: int
     installer_offset: int
     installer_bytes: int
 
 
-def _usb_layout_for_sizes(boot_bytes: int, installer_bytes: int) -> UsbLayout:
-    if any(size <= 0 or size % 1024 for size in (boot_bytes, installer_bytes)):
-        raise ValueError("USB filesystems must have positive, KiB-aligned sizes")
-    if boot_bytes > MAX_BOOT_FLOPPY_KIB * 1024:
-        raise ValueError("USB boot filesystem exceeds the prepared floppy size limit")
+def _usb_layout_for_size(installer_bytes: int) -> UsbLayout:
+    if installer_bytes <= 0 or installer_bytes % 1024:
+        raise ValueError("USB filesystem must have a positive, KiB-aligned size")
     align = 1024 * 1024
-    boot_offset = _USB_PARTITION_OFFSET + _USB_FRONT_PORCH
-    installer_offset = (boot_offset + boot_bytes + align - 1) // align * align
+    installer_offset = _USB_PARTITION_OFFSET + _USB_FRONT_PORCH
     image_bytes = (installer_offset + installer_bytes + align - 1) // align * align
     if image_bytes // 512 > 0xffffffff:
         raise ValueError("USB image exceeds MBR addressing limits")
-    return UsbLayout(image_bytes, boot_offset, boot_bytes, installer_offset, installer_bytes)
+    return UsbLayout(image_bytes, installer_offset, installer_bytes)
 
 
 def _usb_checksum(label: bytes) -> int:
@@ -2108,7 +2104,7 @@ def _usb_checksum(label: bytes) -> int:
     return checksum
 
 
-def _usb_label(layout: UsbLayout, boot_fs: FilesystemInfo, installer_fs: FilesystemInfo) -> bytes:
+def _usb_label(layout: UsbLayout, installer_fs: FilesystemInfo) -> bytes:
     """Encode the native m68k disk_label/disktab wire format used by Intel OPENSTEP.
 
     Partition records are 46 bytes, with signed 32-bit base/size fields.
@@ -2123,25 +2119,21 @@ def _usb_label(layout: UsbLayout, boot_fs: FilesystemInfo, installer_fs: Filesys
     label[0x44:0x44 + 17] = b"removable_rw_scsi"
     struct.pack_into(">IIIII", label, 0x5c, 1024, 64, 32,
                      (layout.image_bytes + 2097151) // 2097152, 3600)
-    struct.pack_into(">H", label, 0x70, layout.boot_offset // 1024)
+    struct.pack_into(">H", label, 0x70, layout.installer_offset // 1024)
     struct.pack_into(">II", label, 0x7c,
                      *[(_USB_PARTITION_OFFSET + offset) // 1024 for offset in _USB_LOADER_OFFSETS])
     label[0x84:0x84 + 12] = b"mach_kernel\0"
-    label[0xbc:0xbe] = b"ab"
+    label[0xbc:0xbe] = b"a\0"
     for index in range(8):
         part = 0xbe + index * 46
         struct.pack_into(">ii", label, part, -1, -1)
-    for index, (offset, size, fs) in enumerate((
-            (layout.boot_offset, layout.boot_bytes, boot_fs),
-            (layout.installer_offset, layout.installer_bytes, installer_fs))):
-        part = 0xbe + index * 46
-        struct.pack_into(">iiHH", label, part,
-                         (offset - layout.boot_offset) // 1024, size // 1024,
-                         fs.block_size, fs.fragment_size)
-        label[part + 12] = ord("t")
-        struct.pack_into(">HH", label, part + 14, fs.cylinders_per_group, 4096)
-        label[part + 18] = 10
-        label[part + 37:part + 44] = b"4.3BSD\0"
+    part = 0xbe
+    struct.pack_into(">iiHH", label, part, 0, layout.installer_bytes // 1024,
+                     installer_fs.block_size, installer_fs.fragment_size)
+    label[part + 12] = ord("t")
+    struct.pack_into(">HH", label, part + 14, installer_fs.cylinders_per_group, 4096)
+    label[part + 18] = 10
+    label[part + 37:part + 44] = b"4.3BSD\0"
     struct.pack_into(">H", label, 0x22e, _usb_checksum(label))
     return bytes(label)
 
@@ -2162,9 +2154,88 @@ def _usb_boot_table(data: bytes) -> bytes:
     table = Table(data)
     flags = [flag for flag in (table.get("Kernel Flags") or "").split()
              if not flag.startswith("rootdev=") and flag != "-a"]
-    table.set("Kernel Flags", " ".join(flags + ["rootdev=sd1b"]))
+    table.set("Kernel Flags", " ".join(flags + ["rootdev=sd1a"]))
+    table.set("Kernel", _USB_KERNEL)
     table.set("Install Mode", "Yes")
     return table.data()
+
+
+def _usb_boot_entries(source: Image) -> list[tuple[str, str, Entry]]:
+    # Keep the CD's root kernel and System Default.table as installation
+    # payloads. The boot-only kernel can be thin/PIC-patched; Default.table
+    # supplies the installed system's flags, including Install Mode = No.
+    source.read(_USB_SYSTEM_TABLE)  # Refuse an unconfigured boot image.
+    entries = [(_USB_KERNEL, "/mach_kernel", source.inspect("/mach_kernel")[0])]
+    for directory in (ROOT, "/usr/standalone/i386"):
+        for entry in source.tree(directory):
+            if entry.name == ".":
+                continue
+            if directory == ROOT and entry.name == "System.config/Default.table":
+                continue
+            # The disk boot stages come from the CD, independently of the
+            # floppy bootloader. Copy its sarld, language table and help files.
+            if directory != ROOT and entry.name in ("boot", "boot0", "boot1"):
+                continue
+            path = directory + "/" + entry.name
+            entries.append((path, path, entry))
+    return entries
+
+
+def prepare_usb_filesystem(boot: PathInput, ufs: PathInput, output: PathInput, *,
+                           nextufs_binary: PathInput | None = None) -> None:
+    """Add boot files to the installer UFS, keeping its installed-system defaults.
+
+    Workspace discovers partition a on removable media. A single filesystem
+    lets that normal mount expose Setup.app and all optional packages.
+    The original floppy is still used to prepare the kernel and boot drivers,
+    but its filesystem is not embedded in the USB image.
+    """
+    binary = executable(nextufs_binary)
+    source = Image(binary, boot)
+    entries = _usb_boot_entries(source)
+    with new_output(output, source=ufs) as staged:
+        _directory_capacity(staged, [entry for _, _, entry in entries], binary)
+        target = Image(binary, staged)
+        if target.child("/NextCD", "boot_kernel") is not None:
+            raise ValueError("USB boot kernel already exists")
+        # Preserve directory metadata, including parents affected by new files.
+        directories: dict[str, Entry] = {}
+
+        def directory(path: str, metadata: Entry) -> None:
+            if path in directories:
+                return
+            if path == "/":
+                directories[path] = target.inspect(path)[0]
+                return
+            parent, _, name = path.rpartition("/")
+            directory(parent or "/", metadata)
+            existing = target.child(parent or "/", name)
+            if existing is None:
+                target.mutate("mkdir", path)
+                directories[path] = (metadata if metadata.is_dir else
+                                     replace(metadata, mode=stat.S_IFDIR | 0o755))
+            elif not existing.is_dir:
+                raise ValueError(f"USB boot directory is not a directory: {path}")
+            else:
+                directories[path] = existing
+
+        for path, original, entry in entries:
+            if entry.is_dir:
+                directory(path, entry)
+                continue
+            parent, _, name = path.rpartition("/")
+            directory(parent, entry)
+            existing = target.child(parent, name)
+            if existing is not None and not stat.S_ISREG(existing.mode):
+                raise ValueError(f"USB boot file is not a regular file: {path}")
+            data = source.read(original, entry)
+            if path == _USB_SYSTEM_TABLE:
+                data = _usb_boot_table(data)
+            target.write(path, data, entry, existing is not None)
+        for path, entry in reversed(list(directories.items())):
+            target.metadata(path, entry)
+        _check_usb_boot_files(boot, staged, nextufs_binary)
+        check_image(staged, nextufs_binary=nextufs_binary)
 
 
 def _usb_ufs_patches(ufs: PathInput) -> dict[int, bytes]:
@@ -2172,7 +2243,7 @@ def _usb_ufs_patches(ufs: PathInput) -> dict[int, bytes]:
 
     The CD uses 2 KiB blocks. OPENSTEP's kernel trusts fs_fsbtodb instead of
     recalculating it at mount time. Geometry and file contents stay unchanged;
-    this filesystem is only used read-only by the installer.
+    the installer mounts this filesystem read-only.
     """
     with Path(ufs).open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
@@ -2221,7 +2292,7 @@ def _check_extent(image: PathInput, offset: int, source: PathInput, *,
 
 
 def usb_layout(path: PathInput) -> UsbLayout:
-    """Validate our USB MBR, all three native labels and the two UFS extents."""
+    """Validate our USB MBR, all three native labels and the single UFS extent."""
     with Path(path).open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         mbr = stream.read(512)
@@ -2243,7 +2314,7 @@ def usb_layout(path: PathInput) -> UsbLayout:
         if labels[1:] != labels[:1] * 2:
             raise ValueError("USB NeXT label copies differ")
         label = labels[0]
-        if (struct.unpack_from(">I", label, 0x5c)[0] != 1024 or label[0xbc:0xbe] != b"ab" or
+        if (struct.unpack_from(">I", label, 0x5c)[0] != 1024 or label[0xbc:0xbe] != b"a\0" or
                 struct.unpack_from(">II", label, 0x7c) != (33, 97) or
                 struct.unpack_from(">I", label, 8)[0] != size // 1024):
             raise ValueError("invalid USB label geometry or boot addresses")
@@ -2252,7 +2323,7 @@ def usb_layout(path: PathInput) -> UsbLayout:
         for index in range(8):
             part = 0xbe + 46 * index
             base, count = struct.unpack_from(">ii", label, part)
-            if index >= 2:
+            if index >= 1:
                 if (base, count) != (-1, -1):
                     raise ValueError("unexpected USB NeXT partition")
                 continue
@@ -2260,56 +2331,46 @@ def usb_layout(path: PathInput) -> UsbLayout:
                 raise ValueError("invalid USB UFS partition")
             extents.extend((front + base * 1024, count * 1024))
         layout = UsbLayout(size, *extents)
-        if layout != _usb_layout_for_sizes(layout.boot_bytes, layout.installer_bytes):
+        if layout != _usb_layout_for_size(layout.installer_bytes):
             raise ValueError("invalid USB filesystem bounds or alignment")
-        for offset in (layout.boot_offset, layout.installer_offset):
-            stream.seek(offset + 8192 + 1372)
-            if stream.read(4) != bytes.fromhex("00011954"):
-                raise ValueError("missing USB UFS superblock")
-            stream.seek(offset + 8192 + 52)
-            fragment = struct.unpack(">I", stream.read(4))[0]
-            stream.seek(offset + 8192 + 100)
-            shift = struct.unpack(">I", stream.read(4))[0]
-            if shift > 8 or fragment != 1024 << shift:
-                raise ValueError("USB UFS block addressing differs from the disk label")
+        stream.seek(layout.installer_offset + 8192 + 1372)
+        if stream.read(4) != bytes.fromhex("00011954"):
+            raise ValueError("missing USB UFS superblock")
+        stream.seek(layout.installer_offset + 8192 + 52)
+        fragment = struct.unpack(">I", stream.read(4))[0]
+        stream.seek(layout.installer_offset + 8192 + 100)
+        shift = struct.unpack(">I", stream.read(4))[0]
+        if shift > 8 or fragment != 1024 << shift:
+            raise ValueError("USB UFS block addressing differs from the disk label")
     return layout
 
 
 def _check_usb_boot_files(boot: PathInput, usb: PathInput, binary: PathInput | None) -> None:
     original, target = (Image(executable(binary), path) for path in (boot, usb))
-    before, after = (sorted(image.tree("/"), key=lambda entry: entry.name) for image in (original, target))
-    if [entry.name for entry in before] != [entry.name for entry in after]:
-        raise ValueError("USB boot filesystem entries differ from the prepared boot image")
-    for entry, actual in zip(before, after):
-        path = "/" + entry.name if entry.name != "." else "/"
+    for path, source_path, entry in _usb_boot_entries(original):
+        # Existing installer directories retain their original metadata.
+        if entry.is_dir:
+            if not target.inspect(path)[0].is_dir:
+                raise ValueError(f"USB boot directory differs: {path}")
+            continue
+        actual = target.inspect(path)[0]
         _verify_metadata(entry, actual, path)
-        if not entry.is_dir:
-            expected = original.read(path, entry)
-            if path == _USB_SYSTEM_TABLE:
-                expected = _usb_boot_table(expected)
-            if target.read(path, actual) != expected:
-                raise ValueError(f"USB boot file differs: {path}")
+        expected = original.read(source_path, entry)
+        if path == _USB_SYSTEM_TABLE:
+            expected = _usb_boot_table(expected)
+        if target.read(path, actual) != expected:
+            raise ValueError(f"USB boot file differs: {path}")
 
 
 def create_usb(boot: PathInput, ufs: PathInput, output: PathInput, *,
                nextufs_binary: PathInput | None = None) -> UsbLayout:
-    """Assemble a native BIOS disk with boot UFS a and read-only installer UFS b."""
+    """Assemble a native BIOS disk from a prepare_usb_filesystem result."""
     loaders = _usb_bootloaders(ufs, nextufs_binary)
     installer_info = _raw_ufs_info(ufs, nextufs_binary)
     patches = _usb_ufs_patches(ufs)
     with new_output(output) as staged:
-        raw_boot = staged.parent / "boot.ufs"
-        extract_ufs(boot, raw_boot, nextufs_binary=nextufs_binary)
-        image = Image(executable(nextufs_binary), raw_boot)
-        entry = image.inspect(_USB_SYSTEM_TABLE)[0]
-        parent = _USB_SYSTEM_TABLE.rsplit("/", 1)[0]
-        parent_entry = image.inspect(parent)[0]
-        image.write(_USB_SYSTEM_TABLE, _usb_boot_table(image.read(_USB_SYSTEM_TABLE, entry)), entry, True)
-        image.metadata(parent, parent_entry)
-        check_image(raw_boot, nextufs_binary=nextufs_binary)
-        boot_info = _raw_ufs_info(raw_boot, nextufs_binary)
-        layout = _usb_layout_for_sizes(boot_info.filesystem_bytes, installer_info.filesystem_bytes)
-        label = _usb_label(layout, boot_info.filesystem, installer_info.filesystem)
+        layout = _usb_layout_for_size(installer_info.filesystem_bytes)
+        label = _usb_label(layout, installer_info.filesystem)
         # boot1 finds the NeXT partition itself; boot0 only adds a menu and bell.
         mbr = bytearray(loaders["boot1"])
         mbr[446:454] = bytes.fromhex("80000300a7feffff")
@@ -2328,16 +2389,14 @@ def create_usb(boot: PathInput, ufs: PathInput, output: PathInput, *,
             for relative in _USB_LOADER_OFFSETS:
                 target.seek(_USB_PARTITION_OFFSET + relative)
                 target.write(loaders["boot"])
-            for offset, source in ((layout.boot_offset, raw_boot), (layout.installer_offset, ufs)):
-                target.seek(offset)
-                with Path(source).open("rb") as payload:
-                    shutil.copyfileobj(payload, target, 1024 * 1024)
+            target.seek(layout.installer_offset)
+            with Path(ufs).open("rb") as payload:
+                shutil.copyfileobj(payload, target, 1024 * 1024)
             for offset, replacement in patches.items():
                 target.seek(layout.installer_offset + offset)
                 target.write(replacement)
         if usb_layout(staged) != layout:
             raise ValueError("assembled USB layout differs")
-        _check_extent(staged, layout.boot_offset, raw_boot)
         _check_extent(staged, layout.installer_offset, ufs, patches=patches)
         _check_usb_boot_files(boot, staged, nextufs_binary)
     return layout
@@ -2640,7 +2699,7 @@ def verify_boot_usb(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                     fix_pic_bug: bool = False, package_hook: bytes = b"",
                     packaged_drivers: Iterable[str] = (), kernel_source: PathInput | None = None,
                     removed_drivers: Iterable[str] = (), bootloader_source: PathInput | None = None) -> None:
-    """Verify native boot stages, prepared boot files, and installer UFS b."""
+    """Verify native boot stages and the combined boot/installer UFS a."""
     _verify_prepared_boot(Path(boot_disk), Path(boot), nextufs_binary, fix_pic_bug, kernel_source, bootloader_source)
     layout = usb_layout(usb)
     if layout.installer_bytes != _raw_ufs_info(ufs, nextufs_binary).filesystem_bytes:
@@ -2659,6 +2718,10 @@ def verify_boot_usb(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                 raise ValueError("USB second-stage boot code differs")
     _check_usb_boot_files(boot, usb, nextufs_binary)
     check_image(usb, nextufs_binary=nextufs_binary)
+    default = ROOT + "/System.config/Default.table"
+    if (Image(executable(nextufs_binary), usb).read(default) !=
+            Image(executable(nextufs_binary), kernel_source or user_cd).read(default)):
+        raise ValueError("USB installer changed the installed-system defaults")
     _verify_installer(boot, user_cd, ufs, nextufs_binary=nextufs_binary,
                       installation_drivers=True, fix_pic_bug=fix_pic_bug, package_hook=package_hook,
                       packaged_drivers=tuple(packaged_drivers), kernel_source=kernel_source, usb=True, disk_limits=True,

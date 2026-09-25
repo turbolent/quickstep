@@ -352,6 +352,11 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         disk_installer = iso.parent / "disk-installer.ufs"
         media.prepare_installer_disks(installer, disk_installer, usb=usb, nextufs_binary=nextufs_binary)
         installer = disk_installer
+        if usb:
+            print("Combining USB boot files and installer into one filesystem...", flush=True)
+            usb_installer = iso.parent / "usb-installer.ufs"
+            media.prepare_usb_filesystem(boot, installer, usb_installer, nextufs_binary=nextufs_binary)
+            installer = usb_installer
         print(f"Building {'USB image' if usb else 'ISO'}: {output}...", flush=True)
         if usb:
             media.create_usb(boot, installer, iso, nextufs_binary=nextufs_binary)
@@ -361,10 +366,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                                   package_hook=package_hook, packaged_drivers=packaged_drivers,
                                   kernel_source=kernel_source, removed_drivers=removed_drivers,
                                   bootloader_source=bootloader_source)
-            # verify_boot_usb checks partition b against this UFS, allowing only
-            # the superblock conversion to the USB label's logical block size.
-            # nextufs's default whole-disk view selects the boot partition a.
-            contents = installer
+            # All contents are accessible through the USB's single partition a.
+            contents = iso
         else:
             media.create_iso(boot, user_cd, installer, iso, volume_id=VOLUME_ID, iso_tool=iso_tool,
                              nextufs_binary=nextufs_binary)

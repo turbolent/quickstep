@@ -104,13 +104,13 @@ by XHCI using `--installation-driver`, plus the destination disk's driver
 2. Boot a USB 2.0 stick on an xHCI controller using legacy BIOS/CSM, with the stick as the first BIOS hard disk.
 3. At the installer's first restart, boot the destination disk and keep the stick attached until installation finishes.
 
-The installer defaults to `sd1b`. If the USB stick has another device number,
+The installer defaults to `sd1a`. If the USB stick has another device number,
 enter `-a` at the `boot:` prompt, then select its installer partition, such as
-`sd0b`. The trailing **`b` is required**.
+`sd0a`.
 
 ### Setup.app
 
-When included, open Setup.app from the mounted CD after booting and configuring the installed system, logged in as root.
+When included, open Setup.app from the mounted CD or OPENSTEP USB volume after booting and configuring the installed system, logged in as root.
 Setup recognizes the automatically installed User Patch 4 receipt and skips reinstalling it.
 FramebufferWC is already installed and activated when built with `--framebuffer-wc`.
 Its Setup choice remains unchecked by default; selecting it reruns the repair action without reinstalling a receipted package.
