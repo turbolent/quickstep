@@ -1,5 +1,5 @@
 /* OPENSTEP 4.2 Configure, Intel slice SHA-256 77e80715...945f.
- * See docs/driver-order.md. No new runtime or Objective-C metadata is needed:
+ * No new runtime or Objective-C metadata is needed:
  * use the executable's existing, runtime-fixed selector and class references.
  * The two saved strings occupy unused, zero-filled __DATA segment padding.
  */
@@ -78,13 +78,42 @@ static void restore(word dict, word key, word original)
     SEND(dict, SET, SEND(ordered, JOIN, SPACE), key);
 }
 
+/* First-time setup ignores Instance*.table and builds its list from live
+ * device discovery. Target-only drivers must also survive that step, even
+ * when their hardware probe fails. The installer explicitly names them in
+ * System.config; do not retain other undetected drivers or re-add a driver
+ * removed from the saved activation lists. Ordinary configuration is unchanged.
+ */
+__attribute__((noinline))
+static void include_install_drivers(word drivers)
+{
+    word dict = SEND(DRIVER_BUNDLE, SYSTEM_DICT);
+    word key = SEND(REF(0x1738b4), REF(0x172f50), "Quickstep Install Drivers");
+    word names = SEND(previous_value(key, dict), SPLIT);
+    word boot = SEND(SAVED[1], SPLIT);
+    word active = SEND(SAVED[0], SPLIT);
+    word n = SEND(names, COUNT), i, name, bundle;
+    for (i = 0; i < n; ++i) {
+        name = SEND(names, AT, i);
+        if (!(unsigned char)SEND(boot, CONTAINS, name) &&
+            !(unsigned char)SEND(active, CONTAINS, name))
+            continue;
+        bundle = SEND(DRIVER_BUNDLE, REF(0x173074), name);
+        if (bundle)
+            SEND(drivers, ADD_UNIQUE, bundle);
+    }
+}
+
 /* Wrap the existing _createDriverListsFrom: dispatch. In ordinary mode no
  * snapshots exist, so dispatch and return without touching the system table.
  */
 __attribute__((section(".text.finish")))
 word finish(word receiver, word selector, word drivers)
 {
-    word result = SEND(receiver, selector, drivers);
+    word result;
+    if (SAVED[0] || SAVED[1])
+        include_install_drivers(drivers);
+    result = SEND(receiver, selector, drivers);
     if (SAVED[0] || SAVED[1]) {
         word dict = SEND(DRIVER_BUNDLE, SYSTEM_DICT);
         restore(dict, ACTIVE, SAVED[0]);

@@ -8,7 +8,7 @@ _PROFILES = (
     (0, "77e807152d49daadc0e9a52c176fa8ab09c7f4206fda4291bc2bf124c39a945f"),
     (0x6e000, "76bde18f0cda564183e88d1e78678b5c3715d873a7cca7728df2a92d6804bdde"),
 )
-_PAYLOAD_HASH = "054f11f1c6f8b82461856a840c4106478edeb40929809c4eb208b6ba634e9ae6"
+_PAYLOAD_HASH = "5ae290ba24b466c7fd3b23dd8ea4c36a252914a383e56c6e204df32b48e6f7a8"
 _PAYLOAD_OFFSET = 0xc50
 _HOOKS = ((0x4810, 0x2c50), (0x4830, 0x2c50), (0x4885, 0x2d50))
 _MSG_SEND = 0x05003477
@@ -19,7 +19,7 @@ def _call(site: int, target: int) -> bytes:
 
 
 def patch_configure_order(binary: bytes) -> bytes:
-    """Keep surviving drivers in their incoming order during installation setup.
+    """Retain explicit target drivers and preserve order during installation setup.
 
     Accept only the known stock thin/fat executables or the complete patch.
     Preserve executable length, Mach-O layout, and non-Intel architectures.

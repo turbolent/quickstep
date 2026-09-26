@@ -1153,6 +1153,7 @@ if [ "${ARCH}" = "i386" ]; then
                         count = split(boot, drivers, " ")
                         added = "@ACTIVE_DRIVERS@"
                         additions = split(added, extra, " ")
+                        targets = "@TARGET_DRIVERS@"
                         removed = "@REMOVED_DRIVERS@"
                         removals = split(removed, excluded, " ")
                         value = ""
@@ -1171,6 +1172,7 @@ if [ "${ARCH}" = "i386" ]; then
                         next
                     }
                     /^[ \t]*"Boot Drivers"[ \t]*=/ { next }
+                    /^[ \t]*"Quickstep Install Drivers"[ \t]*=/ { next }
                     /^[ \t]*"Active Drivers"[ \t]*=/ {
                         split($0, fields, "\"")
                         total = split(fields[4], active, " ")
@@ -1202,6 +1204,8 @@ if [ "${ARCH}" = "i386" ]; then
                         }
                         printf "\"Active Drivers\" = \"%s\";\n", value
                         printf "\"Boot Drivers\" = \"%s\";\n", boot
+                        if (targets != "")
+                            printf "\"Quickstep Install Drivers\" = \"%s\";\n", targets
                     }
                     ' root_device="${diskie}" "${TABLE_FILE}" > "${TABLE_FILE}.quickstep" &&
                     ${MV} "${TABLE_FILE}.quickstep" "${TABLE_FILE}"; then
@@ -1250,20 +1254,25 @@ _INSTALL_PIC_HOOK = br'''    echo "Installing PIC-patched kernel on the startup 
 
 def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_bug: bool = False,
                         package_hook: bytes = b"", active_drivers: Iterable[str] = (),
+                        target_drivers: Iterable[str] = (),
                         removed_drivers: Iterable[str] = ()) -> bytes:
     """Install drivers and optionally a patched kernel/helper before final reboot."""
     names = list(boot_drivers)
     active = list(active_drivers)
+    targets = list(target_drivers)
     removed = list(removed_drivers)
     # These names are embedded in both a shell argument and an OPENSTEP table.
     if not names or any(re.fullmatch(r"[A-Za-z0-9_.+-]+", name) is None for name in names + active + removed):
         raise ValueError("expected a nonempty list of safe boot-driver names")
     if len(set(names + active)) != len(names + active):
         raise ValueError("duplicate installation driver names")
+    if not set(targets) <= set(names + active) or "System" in targets:
+        raise ValueError("target drivers must be activated installation drivers")
     if "System" in removed or set(removed) & set(names + active):
         raise ValueError("cannot remove System.config or an activated installation driver")
     hook = _INSTALL_DRIVER_HOOK.replace(b"@BOOT_DRIVERS@", " ".join(names).encode("ascii"))
     hook = hook.replace(b"@ACTIVE_DRIVERS@", " ".join(active).encode("ascii"))
+    hook = hook.replace(b"@TARGET_DRIVERS@", " ".join(dict.fromkeys(targets)).encode("ascii"))
     hook = hook.replace(b"@REMOVE_HOOK@", _INSTALL_REMOVE_DRIVERS_HOOK if removed else b"")
     hook = hook.replace(b"@REMOVED_DRIVERS@", " ".join(removed).encode("ascii"))
     hook = hook.replace(b"@PIC_HOOK@", _INSTALL_PIC_HOOK if fix_pic_bug else b"")
@@ -1277,9 +1286,34 @@ def _patch_cd_installer(script: bytes, boot_drivers: Iterable[str], *, fix_pic_b
     return script.replace(_INSTALL_DRIVER_ANCHOR, hook + _INSTALL_DRIVER_ANCHOR, 1)
 
 
+def _target_driver_instance(image: Image, name: str) -> tuple[Entry, bytes]:
+    """Use a CD driver's configured instance, falling back to its defaults."""
+    name = driver_name(name)
+    if name == "System":
+        raise ValueError("System.config is not a target driver")
+    bundle = image.bundle(name)
+    entry = image.child(bundle, "Instance0.table")
+    filename = "Instance0.table" if entry is not None else "Default.table"
+    if entry is None:
+        entry = image.inspect(bundle + "/" + filename)[0]
+    data = image.read(bundle + "/" + filename, entry).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return entry, data
+
+
+def _add_target_drivers(source: Image, names: Iterable[str], boot: list[str], active: list[str]) -> None:
+    """Activate target-only drivers according to their CD instance tables."""
+    for name in names:
+        _, data = _target_driver_instance(source, name)
+        boot[:] = [item for item in boot if item != name]
+        active[:] = [item for item in active if item != name]
+        (boot if Table(data).is_boot() else active).append(name)
+
+
 def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = None,
-                         packaged_drivers: Iterable[str] = ()) -> bytes:
-    """Package configured bundles, not the floppy's CD-only System.config."""
+                         packaged_drivers: Iterable[str] = (),
+                         target_source: PathInput | None = None,
+                         target_drivers: Iterable[str] = ()) -> bytes:
+    """Package floppy bundles and full CD bundles needed only on the target disk."""
     drivers = DriverImage(boot, nextufs=nextufs_binary)
     image = Image(executable(nextufs_binary), boot)
     names = drivers.list_drivers()
@@ -1288,15 +1322,27 @@ def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = 
         raise ValueError("packaged driver is missing from the boot floppy")
     if not names:
         raise ValueError("boot floppy has no driver bundles")
+    sources = [(name, image, False) for name in names]
+    targets = [name for name in dict.fromkeys(target_drivers) if name not in names]
+    if targets:
+        if target_source is None:
+            raise ValueError("target drivers require a source filesystem")
+        source = Image(executable(nextufs_binary), target_source)
+        sources.extend((name, source, True) for name in targets)
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        for name in names:
+        for name, image, target_only in sources:
             bundle = image.bundle(name)
             entries = image.tree(bundle)
             if not any(entry.name == "Default.table" for entry in entries):
                 raise ValueError(f"{name}.config has no Default.table")
-            instance = image.inspect(bundle + "/Instance0.table")[0]
-            configuration = image.read(bundle + "/Instance0.table", instance)
+            if target_only:
+                instance, configuration = _target_driver_instance(image, name)
+                if not any(entry.name == "Instance0.table" for entry in entries):
+                    entries.append(replace(instance, name="Instance0.table"))
+            else:
+                instance = image.inspect(bundle + "/Instance0.table")[0]
+                configuration = image.read(bundle + "/Instance0.table", instance)
             # A package installs the original bundle from its BOM. Add only the
             # configured instance; do not overwrite receipted files with the
             # boot floppy's copy or promote its instance to Default.table.
@@ -1305,8 +1351,8 @@ def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = 
             for entry in entries:
                 # The installed loader must use the same variant as the boot floppy.
                 # In particular, EIDE's generic Default.table is not its PIIX table.
-                if entry.name == "Default.table":
-                    entry = replace(instance, name="Default.table")
+                if entry.name in ("Default.table", "Instance0.table"):
+                    entry = replace(instance, name=entry.name)
                     data = configuration
                 else:
                     data = b"" if entry.is_dir else image.read(bundle + "/" + entry.name, entry)
@@ -1324,6 +1370,7 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
                                  nextufs_binary: PathInput | None = None,
                                  fix_pic_bug: bool = False, package_hook: bytes = b"",
                                  packaged_drivers: Iterable[str] = (),
+                                 target_drivers: Iterable[str] = (),
                                  removed_drivers: Iterable[str] = ()) -> None:
     """Prepare a User UFS installer with floppy drivers and an optional PIC fix.
 
@@ -1331,7 +1378,7 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     it after base-system copying/configuration, before reboot. Keep the installer's
     generated System.config and language settings, but replace its Boot Drivers
     with the floppy's ordered list and remove those names from Active Drivers.
-    Merge packaged active drivers in their floppy order, retaining other active
+    Merge bundled active drivers in their floppy order, retaining other active
     drivers and removing duplicates of the added names.
     Update Default.table and any instance tables; do not copy CD-boot settings.
     Set rootdev to the selected destination, preserving other kernel flags,
@@ -1343,21 +1390,33 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     Otherwise, leave kernel installation entirely to the original installer.
     Run package_hook before copying driver configurations. For packaged_drivers,
     stage only Instance0.table; their complete bundles come from package_hook.
+    Copy target_drivers directly from the User filesystem into the archive,
+    creating missing instances from their defaults and activating them only on
+    the startup disk. These complete bundles never pass through the boot floppy.
+    Mark those drivers for Configure's patched first-time setup, which otherwise
+    discards undetected drivers even when their instance files already exist.
     Remove excluded bundles and activation entries from the startup disk after
     base-system and package copying. Keep the CD's original base-system payload.
     """
     packaged_drivers = tuple(packaged_drivers)
+    target_drivers = tuple(dict.fromkeys(driver_name(name) for name in target_drivers))
     with new_output(output, source=user_ufs) as staged:
         image = Image(executable(nextufs_binary), staged)
         path = "/etc/rc.cdrom"
         entry = image.inspect(path)[0]
         _, system = system_table(Image(executable(nextufs_binary), boot))
         boot_names, active_names = driver_lists(system)
+        present = (set(DriverImage(boot, nextufs=nextufs_binary).list_drivers())
+                   if active_names or target_drivers else set())
+        active_names = [name for name in active_names if name in present]
+        targets = [name for name in target_drivers if name not in present]
+        _add_target_drivers(image, targets, boot_names, active_names)
         script = _patch_cd_installer(image.read(path, entry), boot_names,
                                      fix_pic_bug=fix_pic_bug, package_hook=package_hook,
-                                     active_drivers=(name for name in active_names if name in packaged_drivers),
+                                     active_drivers=active_names, target_drivers=targets,
                                      removed_drivers=removed_drivers)
-        archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers)
+        archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers,
+                                       target_source=user_ufs, target_drivers=target_drivers)
         for payload in (_INSTALL_DRIVER_ARCHIVE, _INSTALL_KERNEL, _INSTALL_PIC_SCRIPT):
             if image.child("/NextCD", payload.rsplit("/", 1)[1]) is not None:
                 raise ValueError(f"User filesystem already contains {payload}")
@@ -2656,6 +2715,7 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                    ufs: PathInput, iso: PathInput, *, nextufs_binary: PathInput | None = None,
                    installation_drivers: bool = False, fix_pic_bug: bool = False,
                    package_hook: bytes = b"", packaged_drivers: Iterable[str] = (),
+                   target_drivers: Iterable[str] = (),
                    kernel_source: PathInput | None = None, removed_drivers: Iterable[str] = (),
                    disk_limits: bool = False, bootloader_source: PathInput | None = None) -> None:
     """Check bootloader, El Torito payloads, User UFS, and installer access.
@@ -2682,6 +2742,7 @@ def verify_boot_cd(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     _verify_installer(boot, user_cd, iso, nextufs_binary=nextufs_binary,
                       installation_drivers=installation_drivers, fix_pic_bug=fix_pic_bug,
                       package_hook=package_hook, packaged_drivers=packaged_drivers,
+                      target_drivers=target_drivers,
                       kernel_source=kernel_source, removed_drivers=removed_drivers,
                       disk_limits=disk_limits)
 
@@ -2727,6 +2788,7 @@ def verify_boot_usb(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
                     ufs: PathInput, usb: PathInput, *, nextufs_binary: PathInput | None = None,
                     fix_pic_bug: bool = False, package_hook: bytes = b"",
                     packaged_drivers: Iterable[str] = (), kernel_source: PathInput | None = None,
+                    target_drivers: Iterable[str] = (),
                     removed_drivers: Iterable[str] = (), bootloader_source: PathInput | None = None) -> None:
     """Verify native boot stages and the combined boot/installer UFS a."""
     _verify_prepared_boot(Path(boot_disk), Path(boot), nextufs_binary, fix_pic_bug, kernel_source, bootloader_source)
@@ -2754,6 +2816,7 @@ def verify_boot_usb(boot_disk: PathInput, boot: PathInput, user_cd: PathInput,
     _verify_installer(boot, user_cd, ufs, nextufs_binary=nextufs_binary,
                       installation_drivers=True, fix_pic_bug=fix_pic_bug, package_hook=package_hook,
                       packaged_drivers=tuple(packaged_drivers), kernel_source=kernel_source, usb=True, disk_limits=True,
+                      target_drivers=target_drivers,
                       removed_drivers=removed_drivers)
 
 
@@ -2761,6 +2824,7 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
                       nextufs_binary: PathInput | None, installation_drivers: bool,
                       fix_pic_bug: bool, package_hook: bytes, packaged_drivers: Iterable[str],
                       kernel_source: PathInput | None, usb: bool = False,
+                      target_drivers: Iterable[str] = (),
                       removed_drivers: Iterable[str] = (), disk_limits: bool = False) -> None:
     """Check installer contents through either the CD view or the raw USB UFS."""
     original_script = nextufs("browse", "--raw", user_cd, "/etc/rc.cdrom", binary=nextufs_binary)
@@ -2768,17 +2832,23 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
         _, system = system_table(Image(executable(nextufs_binary), boot))
         boot_names, active_names = driver_lists(system)
         removed_drivers = tuple(removed_drivers)
+        target_drivers = tuple(dict.fromkeys(driver_name(name) for name in target_drivers))
+        present = (set(DriverImage(boot, nextufs=nextufs_binary).list_drivers())
+                   if active_names or removed_drivers or target_drivers else set())
         if removed_drivers:
-            present = set(DriverImage(boot, nextufs=nextufs_binary).list_drivers())
             if set(removed_drivers) & (present | set(boot_names + active_names)):
                 raise ValueError("excluded drivers remain on the boot floppy")
+        active_names = [name for name in active_names if name in present]
+        targets = [name for name in target_drivers if name not in present]
+        _add_target_drivers(Image(executable(nextufs_binary), iso), targets, boot_names, active_names)
         expected_script = _patch_cd_installer(original_script, boot_names,
                                               fix_pic_bug=fix_pic_bug, package_hook=package_hook,
-                                              active_drivers=(name for name in active_names if name in packaged_drivers),
+                                              active_drivers=active_names, target_drivers=targets,
                                               removed_drivers=removed_drivers)
         archive = nextufs("browse", "--raw", iso, _INSTALL_DRIVER_ARCHIVE, binary=nextufs_binary)
-        if archive != _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers):
-            raise ValueError("installation drivers differ from the boot floppy")
+        if archive != _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers,
+                                           target_source=iso, target_drivers=target_drivers):
+            raise ValueError("installation drivers differ from their source bundles")
         original_kernel = nextufs("browse", "--raw", kernel_source or user_cd, "/mach_kernel", binary=nextufs_binary)
         if nextufs("browse", "--raw", iso, "/mach_kernel", binary=nextufs_binary) != original_kernel:
             raise ValueError("User CD kernel differs from the expected kernel")

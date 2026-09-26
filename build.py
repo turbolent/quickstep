@@ -13,6 +13,8 @@ from media import PathInput
 # Recipe choices: edit these and install_drivers() to customize the installation media.
 VOLUME_ID = "OPENSTEP_4_2"
 BOOT_DRIVERS = ("PS2Keyboard", "EISABus", "PCIBus", "Intel824X0", "EIDE")
+# Copy these from the User CD directly to the target-disk installer payload.
+SERIAL_DRIVERS = ("ISASerialPort", "SerialPointingDevice")
 PS2_DRIVERS = ("PS2Keyboard", "PS2Mouse")
 SETUP_CATALOG = media.SetupCatalog(
     packages=(
@@ -321,6 +323,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             print("Preparing PIC-patched kernel for the installed system...", flush=True)
         media.prepare_installation_drivers(boot, ufs, installer, nextufs_binary=nextufs_binary,
                                            fix_pic_bug=fix_pic_bug, package_hook=package_hook,
+                                           target_drivers=SERIAL_DRIVERS,
                                            packaged_drivers=packaged_drivers, removed_drivers=removed_drivers)
         if developer_cd is not None:
             print(f"Adding Developer CD packages from {developer_cd}...", flush=True)
@@ -364,6 +367,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.verify_boot_usb(boot_disk, boot, user_cd, installer, iso,
                                   nextufs_binary=nextufs_binary, fix_pic_bug=fix_pic_bug,
                                   package_hook=package_hook, packaged_drivers=packaged_drivers,
+                                  target_drivers=SERIAL_DRIVERS,
                                   kernel_source=kernel_source, removed_drivers=removed_drivers,
                                   bootloader_source=bootloader_source)
             # All contents are accessible through the USB's single partition a.
@@ -375,6 +379,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.verify_boot_cd(boot_disk, boot, user_cd, installer, iso, nextufs_binary=nextufs_binary,
                                  installation_drivers=True, fix_pic_bug=fix_pic_bug,
                                  package_hook=package_hook, packaged_drivers=packaged_drivers,
+                                 target_drivers=SERIAL_DRIVERS,
                                  kernel_source=kernel_source, removed_drivers=removed_drivers, disk_limits=True,
                                  bootloader_source=bootloader_source)
             contents = iso
