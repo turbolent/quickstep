@@ -103,8 +103,9 @@ def install_driver_package(package: media.PathInput, target_ufs: media.PathInput
                            nextufs_binary: media.PathInput | None = None) -> InstalledDriver:
     """Install a package containing one driver bundle directly in /private/Devices.
 
-    Keep the original payload and receipt intact; configuration and activation
-    are separate operations. Reject unsupported driver layouts before publication.
+    Preserve payload bytes and receipts, but give the installed bundle to root:
+    driverLoader rejects bundles carrying the package builder's uid.
+    Configuration and activation are separate operations.
     """
     with media.new_output(output) as staged:
         installed = install_package(package, target_ufs, staged, nextufs_binary=nextufs_binary)
@@ -121,6 +122,12 @@ def install_driver_package(package: media.PathInput, target_ufs: media.PathInput
             raise ValueError(f"installation driver bundle is not a directory: {bundles[0]}")
         # Every bundle needs its default even if it already has an instance.
         media.Table(image.read(bundles[0] + "/Default.table"))
+        for entry in image.tree(bundles[0]):
+            path = bundles[0] if entry.name == "." else bundles[0] + "/" + entry.name
+            if entry.uid != 0:
+                expected = replace(entry, uid=0)
+                image.metadata(path, expected)
+                media._verify_metadata(expected, image.inspect(path)[0], path)
     return InstalledDriver(name, installed)
 
 

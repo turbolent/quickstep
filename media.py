@@ -1126,6 +1126,15 @@ if [ "${ARCH}" = "i386" ]; then
         echo "Cannot install boot-floppy drivers; installation stopped."
         exit 1
     fi
+    # Packages and the archive can carry their builder's uid. Normalize the
+    # complete driver tree after all copies, regardless of package location.
+    # The trailing /. traverses the installed Devices directory symlink.
+    if "${ROOT}/usr/etc/chown" -R root "${HD}/usr/Devices/."; then
+        echo "Installed drivers are owned by root."
+    else
+        echo "Cannot set installed driver ownership; installation stopped."
+        exit 1
+    fi
 @REMOVE_HOOK@    echo "Configuring installed-system boot settings..."
     SYSTEM_CONFIG="${HD}/usr/Devices/System.config"
     if [ -f "${SYSTEM_CONFIG}/Default.table" ]; then
