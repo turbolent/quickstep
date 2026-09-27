@@ -80,6 +80,8 @@ Advanced partitioning still uses stock fdisk.
 - `--remove-ps2`: remove `PS2Keyboard` and `PS2Mouse` from the boot image and installed system, including their activation entries.
   Works with both CD and USB output. Include replacement keyboard and mouse support using `--installation-driver`.
   The installer removes the startup disk's PS/2 bundles after copying the base system, before rebooting.
+- `--remove-pcmcia`: deactivate `PCMCIABus` and `PCIC` in the boot image for CD or USB output.
+  Their existing activation entries are preserved by default; this flag does not delete their driver bundles.
 - `--fix-pic-bug`: opt in to the PIC interrupt fix for both the boot-floppy kernel and the kernel installed on the hard disk, and install `/usr/bin/fix-pic-bug` for later use.
 - `--nextufs /path/to/nextufs`: select the nextufs executable explicitly.
 - `--iso-tool /path/to/xorriso`: select an ISO tool explicitly (`mkisofs`, `genisoimage`, or `xorriso`).

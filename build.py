@@ -46,7 +46,7 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
                     stage: Path, *, nextufs_binary: PathInput | None = None,
                     installation_driver_bundles: Sequence[PathInput] = (),
                     use_bus_master_ide: bool = False, remove_ps2: bool = False,
-                    framebuffer_wc: bool = False) -> None:
+                    framebuffer_wc: bool = False, remove_pcmcia: bool = False) -> None:
     """Prepare the boot drivers through the root media.py library only."""
     bundles: dict[str, Path] = {}
     for bundle in map(Path, installation_driver_bundles):
@@ -107,10 +107,10 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
             target.configure(name, source_table="EIDE_PIIX.table", overwrite=True)
         else:
             target.configure(name)
-    # The stock instance lists these drivers, but this boot image does not use them.
-    for name in ("PCMCIABus", "PCIC"):
-        print(f"Deactivating {name}...", flush=True)
-        target.deactivate(name)
+    if remove_pcmcia:
+        for name in ("PCMCIABus", "PCIC"):
+            print(f"Deactivating {name}...", flush=True)
+            target.deactivate(name)
     for index, name in enumerate(boot_drivers):
         # Reproduce the tested load order, not a hardware dependency graph.
         print(f"Activating {name}...", flush=True)
@@ -135,7 +135,7 @@ def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput |
             output: PathInput, *, nextufs_binary: PathInput | None = None,
             installation_driver_bundles: Sequence[PathInput] = (),
             use_bus_master_ide: bool = False, remove_languages: bool = False,
-            remove_ps2: bool = False,
+            remove_ps2: bool = False, remove_pcmcia: bool = False,
             kernel_source: PathInput | None = None, bootloader_source: PathInput | None = None) -> None:
     """Make a grown, driver-equipped copy; publish only after every step succeeds."""
     print(f"Copying boot floppy from {boot_disk}...", flush=True)
@@ -155,6 +155,7 @@ def drivers(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput |
         install_drivers(image, driver_disk, beta_disk, image.parent, nextufs_binary=nextufs_binary,
                         installation_driver_bundles=installation_driver_bundles,
                         use_bus_master_ide=use_bus_master_ide, remove_ps2=remove_ps2,
+                        remove_pcmcia=remove_pcmcia,
                         **({"framebuffer_wc": True} if bootloader_source is not None else {}))
         if bootloader_source is not None:
             print("Installing VBE-capable Patch 4 floppy bootloader...", flush=True)
@@ -172,7 +173,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           nextufs_binary: PathInput | None = None, bus_master_ide: PathInput | None = None,
           fix_pic_bug: bool = False, developer_cd: PathInput | None = None,
           user_patch: PathInput | None = None, developer_patch: PathInput | None = None,
-          remove_languages: bool = False, remove_ps2: bool = False, setup_app: PathInput | None = None,
+          remove_languages: bool = False, remove_ps2: bool = False, remove_pcmcia: bool = False,
+          setup_app: PathInput | None = None,
           profile_libs_patch: PathInput | None = None,
           driver_packages: Sequence[PathInput] = (), framebuffer_wc: PathInput | None = None,
           installation_drivers: Sequence[PathInput] = (), usb: bool = False) -> None:
@@ -297,7 +299,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         print(f"Preparing boot floppy and drivers from {boot_disk}...", flush=True)
         drivers(boot_disk, driver_disk, beta_disk, boot, nextufs_binary=nextufs_binary,
                 installation_driver_bundles=driver_bundles, use_bus_master_ide=bus_master_ide is not None,
-                remove_languages=remove_languages, remove_ps2=remove_ps2, kernel_source=kernel_source,
+                remove_languages=remove_languages, remove_ps2=remove_ps2, remove_pcmcia=remove_pcmcia,
+                kernel_source=kernel_source,
                 **({"bootloader_source": bootloader_source} if bootloader_source is not None else {}))
         if remove_languages:
             print("Removing optional non-English language packages and receipts...", flush=True)
@@ -436,6 +439,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="omit non-English boot translations and French, German, Italian, Spanish and Swedish Essentials packages and receipts")
     parser.add_argument("--remove-ps2", action="store_true",
                         help="remove PS/2 keyboard and mouse drivers from the boot image and installed system")
+    parser.add_argument("--remove-pcmcia", action="store_true",
+                        help="deactivate PCMCIABus and PCIC in the boot image (default: keep enabled)")
     parser.add_argument("--beta-disk", type=Path,
                         help="beta-driver floppy (required unless --bus-master-ide is provided)")
     parser.add_argument("--bus-master-ide", type=Path, metavar="PACKAGE",
@@ -450,7 +455,8 @@ def main(argv: Sequence[str] | None = None) -> int:
               user_cd=args.user_cd, output=args.output, iso_tool=args.iso_tool, nextufs_binary=args.nextufs,
               bus_master_ide=args.bus_master_ide, fix_pic_bug=args.fix_pic_bug, developer_cd=args.developer_cd,
               user_patch=args.user_patch, developer_patch=args.developer_patch,
-              remove_languages=args.remove_languages, remove_ps2=args.remove_ps2, setup_app=args.setup_app,
+              remove_languages=args.remove_languages, remove_ps2=args.remove_ps2,
+              remove_pcmcia=args.remove_pcmcia, setup_app=args.setup_app,
               profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package,
               framebuffer_wc=args.framebuffer_wc, installation_drivers=args.installation_driver,
               usb=args.usb)
