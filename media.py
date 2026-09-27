@@ -36,6 +36,7 @@ __all__ = [
     "UsbLayout", "prepare_usb_filesystem", "create_usb", "usb_layout", "verify_boot_usb",
     "skip_boot_language_selection",
     "remove_boot_languages",
+    "package_name", "remove_packages", "verify_removed_packages",
     "remove_language_packages", "patch_builddisk_language_heading", "patch_builddisk_capacity",
     "fix_builddisk_capacity",
     "patch_configure_order", "fix_configure_order", "verify_configure_order",
@@ -1665,6 +1666,37 @@ def fix_configure_order(user_ufs: PathInput, output: PathInput, *,
         check_image(staged, nextufs_binary=binary)
 
 
+def package_name(name: str) -> str:
+    """Normalize a package basename, accepting an optional .pkg suffix."""
+    return component(name[:-4] if name.endswith(".pkg") else name) + ".pkg"
+
+
+def _package_parents(image: Image) -> Iterator[tuple[str, Entry]]:
+    """Find package inventories without following symlinks; allow absent roots."""
+    for parts in (("NextCD", "Packages"), ("NextLibrary", "Receipts")):
+        parent = ""
+        for part in parts:
+            entry = image.child(parent or "/", part)
+            if entry is None:
+                break
+            parent += "/" + part
+            if not entry.is_dir:
+                raise ValueError(f"not a directory: {parent}")
+        else:
+            yield parent, entry
+
+
+def verify_removed_packages(image: PathInput, packages: Iterable[str], *,
+                            nextufs_binary: PathInput | None = None) -> None:
+    """Check that named bundles and installer inventory receipts are absent."""
+    names = {package_name(name) for name in packages}
+    target = Image(executable(nextufs_binary), image)
+    for parent, _ in _package_parents(target):
+        remaining = names & {entry.name for entry in target.inspect(parent)[1:]}
+        if remaining:
+            raise ValueError(f"removed packages remain in {parent}: {', '.join(sorted(remaining))}")
+
+
 def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
                              nextufs_binary: PathInput | None = None) -> None:
     """Copy a User UFS without the five optional non-English Essentials packages.
@@ -1677,6 +1709,19 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
     """
     packages = {language + "Essentials.pkg" for language in
                 ("French", "German", "Italian", "Spanish", "Swedish")}
+    remove_packages(user_ufs, output, packages, remove_language_heading=True,
+                    nextufs_binary=nextufs_binary)
+
+
+def remove_packages(user_ufs: PathInput, output: PathInput, packages: Iterable[str], *,
+                    nextufs_binary: PathInput | None = None,
+                    remove_language_heading: bool = False) -> None:
+    """Copy a raw UFS without named distribution packages and inventory receipts.
+
+    Names are exact basenames with an optional .pkg suffix. Missing packages and
+    duplicates are harmless. Installed payload files are not uninstalled.
+    """
+    packages = {package_name(name) for name in packages}
     binary = executable(nextufs_binary)
     _raw_ufs_info(user_ufs, binary)
     source = Image(binary, user_ufs)
@@ -1684,8 +1729,8 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
     trees: list[tuple[str, list[Entry]]] = []
     # Validate every target before editing the staged copy. Refuse symlinks,
     # including in parent paths, rather than following them outside a bundle.
-    for parent in ("/NextCD/Packages", "/NextLibrary/Receipts"):
-        parents.append((parent, _directory(source, parent)))
+    for parent, entry in _package_parents(source):
+        parents.append((parent, entry))
         for entry in source.inspect(parent)[1:]:
             if entry.name in packages:
                 path = parent + "/" + entry.name
@@ -1693,7 +1738,7 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
                 trees.append((path, source.tree(path)))
     application = "/NextAdmin/BuildDisk.app"
     builddisk = None
-    if source.child("/", "NextAdmin") is not None:
+    if remove_language_heading and source.child("/", "NextAdmin") is not None:
         _directory(source, "/NextAdmin")
         if source.child("/NextAdmin", "BuildDisk.app") is not None:
             app_metadata = _directory(source, application)
@@ -1717,7 +1762,7 @@ def remove_language_packages(user_ufs: PathInput, output: PathInput, *,
             for entry in reversed(entries):
                 path = root if entry.name == "." else root + "/" + entry.name
                 target.mutate("rmdir" if entry.is_dir else "unlink", path)
-        print("Verifying language-package removal...", flush=True)
+        print("Verifying package removal...", flush=True)
         for parent, entry in parents:
             target.metadata(parent, entry)
             expected = {child.name for child in source.inspect(parent)[1:]} - packages
@@ -1735,6 +1780,8 @@ def _raw_ufs_info(path: PathInput, binary: PathInput | None) -> ImageInfo:
 
 def _directory_capacity(image: Path, entries: list[Entry], binary: PathInput | None) -> None:
     info = _raw_ufs_info(image, binary)
+    if not entries:
+        return
     block = info.filesystem.block_size
     required = sum(max(1, (entry.size + block - 1) // block) * block for entry in entries)
     reserve = max(16 * 1024 * 1024, (required + 9) // 10)
@@ -1755,13 +1802,14 @@ def _directory_capacity(image: Path, entries: list[Entry], binary: PathInput | N
 
 def copy_directory(source_image: PathInput, source_path: str, target_ufs: PathInput,
                    target_path: str, output: PathInput, *,
-                   nextufs_binary: PathInput | None = None) -> None:
+                   nextufs_binary: PathInput | None = None, exclude: Iterable[str] = ()) -> None:
     """Copy directory contents into a new raw UFS, growing it when necessary.
 
     Existing destination directories retain their metadata; existing children
     are never overwritten or merged. New directories and regular files retain
     source metadata and bytes, with no format-specific transformations.
     Symlinks and special files are unsupported. Inputs remain untouched.
+    Exclude names skip whole top-level children, including their space budget.
     """
     print(f"Inspecting directory {source_path}...", flush=True)
     if not target_path.startswith("/"):
@@ -1770,7 +1818,9 @@ def copy_directory(source_image: PathInput, source_path: str, target_ufs: PathIn
     source = Image(binary, source_image)
     source_root = _directory(source, source_path)
     source_path, target_path = source_path.rstrip("/"), target_path.rstrip("/")
-    entries = source.tree(source_path or "/")
+    excluded = {component(name) for name in exclude}
+    entries = [entry for entry in source.tree(source_path or "/")
+               if entry.name.split("/", 1)[0] not in excluded]
     target = Image(binary, target_ufs)
     parent, _, name = target_path.rpartition("/")
     _directory(target, parent or "/")
@@ -1782,7 +1832,7 @@ def copy_directory(source_image: PathInput, source_path: str, target_ufs: PathIn
             if entry.name.split("/", 1)[0] in children:
                 raise ValueError(f"destination already contains {target_path}/{entry.name}")
     with new_output(output, source=target_ufs) as staged:
-        _directory_capacity(staged, entries, binary)
+        _directory_capacity(staged, entries if existing is None else entries[1:], binary)
         target = Image(binary, staged)
         if existing is None:
             target.mutate("mkdir", target_path)
@@ -1799,7 +1849,7 @@ def copy_directory(source_image: PathInput, source_path: str, target_ufs: PathIn
                 target.metadata(target_path + "/" + entry.name, entry)
         target.metadata(target_path or "/", existing if existing is not None else source_root)
         verify_directory_copy(source_image, source_path or "/", staged, target_path or "/",
-                              nextufs_binary=binary)
+                              nextufs_binary=binary, exclude=excluded)
 
 
 def _verify_metadata(expected: Entry, actual: Entry, path: str) -> None:
@@ -1810,19 +1860,23 @@ def _verify_metadata(expected: Entry, actual: Entry, path: str) -> None:
 
 
 def verify_directory_copy(source_image: PathInput, source_path: str, target_image: PathInput,
-                          target_path: str, *, nextufs_binary: PathInput | None = None) -> None:
+                          target_path: str, *, nextufs_binary: PathInput | None = None,
+                          exclude: Iterable[str] = ()) -> None:
     """Check copied contents and metadata; allow unrelated destination children.
 
     The destination root's metadata is excluded because a pre-existing directory
     retains its own metadata. Inode numbers and directory allocation sizes need
-    not match across filesystems.
+    not match across filesystems. Exclude names skip whole top-level children.
     """
     print(f"Verifying copied directory {target_path}...", flush=True)
     binary = executable(nextufs_binary)
     source, target = Image(binary, source_image), Image(binary, target_image)
     _directory(source, source_path)
     _directory(target, target_path)
+    excluded = {component(name) for name in exclude}
     for entry in source.tree(source_path)[1:]:
+        if entry.name.split("/", 1)[0] in excluded:
+            continue
         path = target_path.rstrip("/") + "/" + entry.name
         actual = target.inspect(path)[0]
         _verify_metadata(entry, actual, path)
@@ -1898,18 +1952,21 @@ def tar_entries(archive: PathInput) -> list[Entry]:
 
 
 def copy_tar(archive: PathInput, target_ufs: PathInput, target_path: str, output: PathInput, *,
-             nextufs_binary: PathInput | None = None) -> None:
+             nextufs_binary: PathInput | None = None, exclude: Iterable[str] = ()) -> None:
     """Import a tar into an existing directory in a new, automatically grown UFS.
 
     Preserve bytes, modes, ownership and mtime; use mtime for atime. Missing
     parent directories use mode 0755 and their first child's ownership/mtime.
     Reject collisions, unsafe names, links and special files. No host extraction,
     script execution or interpretation of nested archives is performed.
+    Exclude names skip whole top-level children, including their space budget.
     """
     print(f"Inspecting archive {archive}...", flush=True)
     binary = executable(nextufs_binary)
+    excluded = {component(name) for name in exclude}
     with tarfile.open(archive, "r:*") as source:
-        entries = _tar_entries(source)
+        entries = [item for item in _tar_entries(source)
+                   if item.entry.name.split("/", 1)[0] not in excluded]
         target = Image(binary, target_ufs)
         root = _directory(target, target_path)
         target_path = target_path.rstrip("/")
@@ -1932,18 +1989,21 @@ def copy_tar(archive: PathInput, target_ufs: PathInput, target_path: str, output
                 if item.entry.is_dir:
                     target.metadata(target_path + "/" + item.entry.name, item.entry)
             target.metadata(target_path or "/", root)
-            verify_tar_copy(archive, staged, target_path or "/", nextufs_binary=binary)
+            verify_tar_copy(archive, staged, target_path or "/", nextufs_binary=binary, exclude=excluded)
 
 
 def verify_tar_copy(archive: PathInput, target_image: PathInput, target_path: str, *,
-                    nextufs_binary: PathInput | None = None) -> None:
-    """Compare imported archive contents and metadata through a raw UFS or ISO."""
+                    nextufs_binary: PathInput | None = None, exclude: Iterable[str] = ()) -> None:
+    """Compare imported contents, optionally excluding named top-level children."""
     print(f"Verifying {archive}...", flush=True)
     target = Image(executable(nextufs_binary), target_image)
     _directory(target, target_path)
+    excluded = {component(name) for name in exclude}
     with tarfile.open(archive, "r:*") as source:
         for item in _tar_entries(source):
             entry = item.entry
+            if entry.name.split("/", 1)[0] in excluded:
+                continue
             path = target_path.rstrip("/") + "/" + entry.name
             actual = target.inspect(path)[0]
             _verify_metadata(entry, actual, path)

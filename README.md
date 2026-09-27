@@ -77,6 +77,10 @@ Advanced partitioning still uses stock fdisk.
   Do not also supply VBE or FramebufferWC through `--installation-driver`.
 - `--remove-languages`: remove non-English boot-floppy translations and additional language packages and their receipt entries from the generated CD.
   English and existing localized files in the base system are retained.
+- `--remove-package NAME`: omit a package and its installer receipt from the CD or USB image.
+  Repeat for multiple packages, for example `--remove-package WebsterIllustrations --remove-package Help.pkg`.
+  Names are case-sensitive; `.pkg` is optional and missing packages are ignored.
+  Existing base-system files remain installed. Packages required by `--installation-driver`, `--bus-master-ide`, or `--framebuffer-wc` cannot be removed.
 - `--remove-ps2`: remove `PS2Keyboard` and `PS2Mouse` from the boot image and installed system, including their activation entries.
   Works with both CD and USB output. Include replacement keyboard and mouse support using `--installation-driver`.
   The installer removes the startup disk's PS/2 bundles after copying the base system, before rebooting.

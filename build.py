@@ -177,12 +177,16 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
           setup_app: PathInput | None = None,
           profile_libs_patch: PathInput | None = None,
           driver_packages: Sequence[PathInput] = (), framebuffer_wc: PathInput | None = None,
-          installation_drivers: Sequence[PathInput] = (), usb: bool = False) -> None:
+          installation_drivers: Sequence[PathInput] = (), usb: bool = False,
+          remove_packages: Sequence[str] = ()) -> None:
     """Build and check installation media; publish only after all checks pass."""
+    remove_packages = tuple(dict.fromkeys(media.package_name(name) for name in remove_packages))
     if usb and iso_tool is not None:
         raise ValueError("--iso-tool cannot be used with --usb")
     if framebuffer_wc is not None and user_patch is None:
         raise ValueError("--framebuffer-wc requires --user-patch")
+    if framebuffer_wc is not None and "FramebufferWC.pkg" in remove_packages:
+        raise ValueError("--remove-package FramebufferWC conflicts with --framebuffer-wc")
     if beta_disk is None and bus_master_ide is None:
         raise ValueError("beta_disk is required unless bus_master_ide is provided")
     print("Checking input paths and build tools...", flush=True)
@@ -245,6 +249,17 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
         driver_bundles: list[Path] = []
         print(f"Extracting User CD filesystem from {user_cd}...", flush=True)
         media.extract_ufs(user_cd, ufs, nextufs_binary=nextufs_binary)
+        # Reclaim space before patches and drivers can trigger filesystem growth.
+        if remove_packages:
+            print("Removing selected packages and installer receipts...", flush=True)
+            pruned = iso.parent / "pruned.ufs"
+            media.remove_packages(ufs, pruned, remove_packages, nextufs_binary=nextufs_binary)
+            ufs = pruned
+        if remove_languages:
+            print("Removing optional non-English language packages and receipts...", flush=True)
+            pruned = iso.parent / "english.ufs"
+            media.remove_language_packages(ufs, pruned, nextufs_binary=nextufs_binary)
+            ufs = pruned
         kernel_source: Path | None = None
         prepared_patch: pkg.PreparedUserPatch | None = None
         package_hook = b""
@@ -258,6 +273,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             packaged = iso.parent / f"installation-driver-{index}.ufs"
             print(f"Installing driver package from {path} on the CD...", flush=True)
             installed = pkg.install_driver_package(path, ufs, packaged, nextufs_binary=nextufs_binary)
+            if installed.package.name + ".pkg" in remove_packages:
+                raise ValueError(f"--remove-package conflicts with installation driver package {installed.package.name}")
             if index == 0 and bus_master_ide is not None and installed.name != "BusMasterIDE":
                 raise ValueError("--bus-master-ide requires a package containing BusMasterIDE.config")
             if any(item.name == installed.name or item.package.name == installed.package.name
@@ -302,11 +319,6 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                 remove_languages=remove_languages, remove_ps2=remove_ps2, remove_pcmcia=remove_pcmcia,
                 kernel_source=kernel_source,
                 **({"bootloader_source": bootloader_source} if bootloader_source is not None else {}))
-        if remove_languages:
-            print("Removing optional non-English language packages and receipts...", flush=True)
-            pruned = iso.parent / "english.ufs"
-            media.remove_language_packages(ufs, pruned, nextufs_binary=nextufs_binary)
-            ufs = pruned
         print("Fixing BuildDisk's 4 GiB capacity calculation...", flush=True)
         with_builddisk = iso.parent / "builddisk.ufs"
         media.fix_builddisk_capacity(ufs, with_builddisk, nextufs_binary=nextufs_binary)
@@ -332,7 +344,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             print(f"Adding Developer CD packages from {developer_cd}...", flush=True)
             combined = iso.parent / "combined.ufs"
             media.copy_directory(developer_cd, "/NextCD/Packages", installer, "/NextCD/Packages",
-                                 combined, nextufs_binary=nextufs_binary)
+                                 combined, nextufs_binary=nextufs_binary, exclude=remove_packages)
             installer = combined
         for archive, package in patches:
             if archive is not None:
@@ -340,13 +352,13 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                 print(f"Adding {package} {purpose}...", flush=True)
                 patched_ufs = iso.parent / (package + ".ufs")
                 media.copy_tar(archive, installer, "/NextCD/Packages", patched_ufs,
-                               nextufs_binary=nextufs_binary)
+                               nextufs_binary=nextufs_binary, exclude=remove_packages)
                 installer = patched_ufs
         for index, archive in enumerate(driver_archives):
             print(f"Adding driver package {optional_drivers[index][0]} for manual installation...", flush=True)
             with_driver = iso.parent / f"driver-package-{index}.ufs"
             media.copy_tar(archive, installer, "/NextCD/Packages", with_driver,
-                           nextufs_binary=nextufs_binary)
+                           nextufs_binary=nextufs_binary, exclude=remove_packages)
             installer = with_driver
         if setup_app is not None:
             print("Adding Setup.app for post-installation package setup...", flush=True)
@@ -387,6 +399,8 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                                  bootloader_source=bootloader_source)
             contents = iso
         media.verify_configure_order(contents, nextufs_binary=nextufs_binary)
+        if remove_packages:
+            media.verify_removed_packages(contents, remove_packages, nextufs_binary=nextufs_binary)
         if framebuffer_wc is not None:
             media.verify_framebuffer_wc(contents, nextufs_binary=nextufs_binary)
         if prepared_patch is not None:
@@ -395,12 +409,15 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
                                         prepared_patch.receipt_source, nextufs_binary=nextufs_binary)
         if developer_cd is not None:
             media.verify_directory_copy(developer_cd, "/NextCD/Packages", contents, "/NextCD/Packages",
-                                        nextufs_binary=nextufs_binary)
+                                        nextufs_binary=nextufs_binary,
+                                        **({"exclude": remove_packages} if remove_packages else {}))
         for archive, _ in patches:
             if archive is not None:
-                media.verify_tar_copy(archive, contents, "/NextCD/Packages", nextufs_binary=nextufs_binary)
+                media.verify_tar_copy(archive, contents, "/NextCD/Packages", nextufs_binary=nextufs_binary,
+                                      **({"exclude": remove_packages} if remove_packages else {}))
         for archive in driver_archives:
-            media.verify_tar_copy(archive, contents, "/NextCD/Packages", nextufs_binary=nextufs_binary)
+            media.verify_tar_copy(archive, contents, "/NextCD/Packages", nextufs_binary=nextufs_binary,
+                                  **({"exclude": remove_packages} if remove_packages else {}))
         if setup_app is not None:
             media.verify_setup_app(setup_app, contents, catalog=catalog, fix_pic_bug=fix_pic_bug,
                                    nextufs_binary=nextufs_binary)
@@ -437,6 +454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="apply the PIC interrupt fix to the boot and installed kernels")
     parser.add_argument("--remove-languages", action="store_true",
                         help="omit non-English boot translations and French, German, Italian, Spanish and Swedish Essentials packages and receipts")
+    parser.add_argument("--remove-package", action="append", default=[], metavar="NAME",
+                        help="remove a distribution package and its inventory receipt (repeatable; .pkg suffix optional)")
     parser.add_argument("--remove-ps2", action="store_true",
                         help="remove PS/2 keyboard and mouse drivers from the boot image and installed system")
     parser.add_argument("--remove-pcmcia", action="store_true",
@@ -459,7 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               remove_pcmcia=args.remove_pcmcia, setup_app=args.setup_app,
               profile_libs_patch=args.profile_libs_patch, driver_packages=args.optional_driver_package,
               framebuffer_wc=args.framebuffer_wc, installation_drivers=args.installation_driver,
-              usb=args.usb)
+              usb=args.usb, remove_packages=args.remove_package)
     except (media.MediaError, OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"build.py: {exc}\n")
     return 0
