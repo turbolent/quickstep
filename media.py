@@ -48,6 +48,7 @@ __all__ = [
     "MAX_GROWN_FLOPPY_KIB", "MAX_BOOT_FLOPPY_KIB",
     "patch_vbe_cache", "prepare_framebuffer_wc", "configure_framebuffer_wc",
     "verify_framebuffer_wc", "copy_bootloader",
+    "configure_ehci_instances",
 ]
 PathInput: TypeAlias = str | os.PathLike[str]
 
@@ -736,6 +737,35 @@ def patch_vbe_cache(binary: bytes) -> bytes:
     return bytes(result)
 
 
+def configure_ehci_instances(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
+    """Configure the first two matching EHCI controllers without fixed PCI locations.
+
+    PCIBus interprets Instance as an index into all matching Auto Detect IDs.
+    Both tables therefore need the complete list, including on mixed controllers.
+    Only the first controller owns the driver's singleton USB input service.
+    """
+    with transaction(Image(executable(nextufs_binary), image)) as target:
+        bundle = target.bundle("EHCI")
+        ids = Table(target.read(bundle + "/Default.table")).get("Auto Detect IDs")
+        if not ids or not ids.strip():
+            raise MediaError("EHCI Default.table must define Auto Detect IDs")
+        _configure(target, "EHCI", "Default.table", False, {})
+        template = target.inspect(bundle + "/Instance0.table")[0]
+        data = target.read(bundle + "/Instance0.table", template)
+        data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        for index in range(2):
+            table = Table(data)
+            for key, value in {"Location": "", "Instance": str(index),
+                               "Auto Detect IDs": ids,
+                               "USB Input": "Yes" if index == 0 else "No"}.items():
+                table.set(key, value)
+            filename = f"Instance{index}.table"
+            path = bundle + "/" + filename
+            existing = target.child(bundle, filename)
+            if existing is None or target.read(path, existing) != table.data():
+                target.write(path, table.data(), existing or template, existing is not None)
+
+
 def configure_framebuffer_wc(image: PathInput, *, nextufs_binary: PathInput | None = None) -> None:
     """Configure VBE and WC as consecutive boot drivers, preserving other settings."""
     with transaction(Image(executable(nextufs_binary), image)) as target:
@@ -1345,10 +1375,11 @@ def _boot_driver_archive(boot: PathInput, *, nextufs_binary: PathInput | None = 
                 instance = image.inspect(bundle + "/Instance0.table")[0]
                 configuration = image.read(bundle + "/Instance0.table", instance)
             # A package installs the original bundle from its BOM. Add only the
-            # configured instance; do not overwrite receipted files with the
+            # configured instances; do not overwrite receipted files with the
             # boot floppy's copy or promote its instance to Default.table.
             if name in packaged:
-                entries = [replace(instance, name="Instance0.table")]
+                entries = [entry for entry in entries
+                           if stat.S_ISREG(entry.mode) and re.fullmatch(r"Instance[0-9]+\.table", entry.name)]
             for entry in entries:
                 # The installed loader must use the same variant as the boot floppy.
                 # In particular, EIDE's generic Default.table is not its PIIX table.
@@ -1390,7 +1421,7 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
     Also install /usr/bin/fix-pic-bug so Patch 4's kernel can be patched later.
     Otherwise, leave kernel installation entirely to the original installer.
     Run package_hook before copying driver configurations. For packaged_drivers,
-    stage only Instance0.table; their complete bundles come from package_hook.
+    stage only configured instance tables; their complete bundles come from package_hook.
     Copy target_drivers directly from the User filesystem into the archive,
     creating missing instances from their defaults and activating them only on
     the startup disk. These complete bundles never pass through the boot floppy.

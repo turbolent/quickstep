@@ -51,11 +51,16 @@ Advanced partitioning still uses stock fdisk.
   Each package must be script-free and install one `.config` bundle directly in `/private/Devices`.
   Driver activation follows `Instance0.table` (created from `Default.table` if missing), including its `Boot Driver` setting.
   Added drivers retain their command-line order within each activation list.
-  The installed system receives each complete package and receipt, plus the configured instance from the boot floppy.
+  The installed system receives each complete package and receipt, plus all configured instance tables from the boot floppy.
   This also applies to `--bus-master-ide`; its only special behavior is replacing EIDE.
   These drivers are installed during system installation, not offered as optional Setup choices, and must fit on the boot floppy.
   Debug symbols are stripped automatically from boot-floppy driver binaries;
-  the original packages and the payloads installed on the CD and startup disk remain unchanged.
+  the original packages and the driver binaries installed on the CD and startup disk remain unchanged.
+  [EHCI](https://github.com/turbolent/EHCI) gets two portable instances automatically: `Instance0.table` and `Instance1.table`,
+  with empty `Location`, `Instance = 0` / `1`, and the same full `Auto Detect IDs` from the package's `Default.table`.
+  PCIBus selects the first and second matching controllers; a missing second controller is skipped.
+  USB input is enabled on the first controller only; both support storage.
+  These configured tables follow the driver onto CD/USB boot media and the installed system.
 - `--developer-cd /path/to/Developer.iso`: include the Developer CD packages.
 - `--user-patch /path/to/OS42MachUserPatch4.tar`: apply User Patch 4 to the CD filesystem and boot-floppy kernel, and install it automatically on the startup disk.
   The startup disk receives the complete patch, its receipt, and the VBE-enabled bootloader.

@@ -105,6 +105,9 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
         print(f"Configuring {name}...", flush=True)
         if name == "EIDE" and name not in bundles:
             target.configure(name, source_table="EIDE_PIIX.table", overwrite=True)
+        elif name == "EHCI":
+            print("Configuring two automatically detected EHCI controllers...", flush=True)
+            media.configure_ehci_instances(image, nextufs_binary=nextufs_binary)
         else:
             target.configure(name)
     if remove_pcmcia:
