@@ -5,10 +5,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+import shutil
 
 import media
 import pkg
 from media import PathInput
+from pcibus_patch import patch_pcibus_multifunction
 
 # Recipe choices: edit these and install_drivers() to customize the installation media.
 VOLUME_ID = "OPENSTEP_4_2"
@@ -100,6 +102,13 @@ def install_drivers(image: PathInput, driver_disk: PathInput, beta_disk: PathInp
             local = stage / (name + ".config")
             print(f"Extracting {name} from {source_disk}...", flush=True)
             source.extract(name, local)
+        if name == "PCIBus":
+            print("Fixing PCIBus multifunction enumeration...", flush=True)
+            fixed = stage / "pcibus-fixed" / "PCIBus.config"
+            shutil.copytree(local, fixed)
+            binary = fixed / "PCIBus_reloc"
+            binary.write_bytes(patch_pcibus_multifunction(binary.read_bytes()))
+            local = fixed
         print(f"Stripping debug symbols and storing {name} on the boot floppy...", flush=True)
         target.store(name, local, strip_debug=True)
         print(f"Configuring {name}...", flush=True)

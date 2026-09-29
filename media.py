@@ -24,6 +24,7 @@ from typing import TypeAlias
 
 from macho import strip_driver_debug
 from configure_patch import patch_configure_order
+from pcibus_patch import patch_pcibus_multifunction
 
 
 ROOT = "/private/Drivers/i386"
@@ -1449,6 +1450,16 @@ def prepare_installation_drivers(boot: PathInput, user_ufs: PathInput, output: P
                                      removed_drivers=removed_drivers)
         archive = _boot_driver_archive(boot, nextufs_binary=nextufs_binary, packaged_drivers=packaged_drivers,
                                        target_source=user_ufs, target_drivers=target_drivers)
+        if "PCIBus" in boot_names:
+            # The ISO also exposes the User CD's driver bundle, independently
+            # of its embedded boot floppy and BootDrivers.tar. Patch that copy
+            # here, before the USB-only merge, so both media formats receive it.
+            pci_path = image.bundle("PCIBus") + "/PCIBus_reloc"
+            pci_entry = image.inspect(pci_path)[0]
+            pci_fixed = patch_pcibus_multifunction(image.read(pci_path, pci_entry))
+            image.write(pci_path, pci_fixed, pci_entry, exists=True)
+            if image.read(pci_path) != pci_fixed:
+                raise ValueError("CD PCIBus patch readback failed")
         for payload in (_INSTALL_DRIVER_ARCHIVE, _INSTALL_KERNEL, _INSTALL_PIC_SCRIPT):
             if image.child("/NextCD", payload.rsplit("/", 1)[1]) is not None:
                 raise ValueError(f"User filesystem already contains {payload}")
@@ -2922,6 +2933,13 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
     if installation_drivers:
         _, system = system_table(Image(executable(nextufs_binary), boot))
         boot_names, active_names = driver_lists(system)
+        if "PCIBus" in boot_names:
+            for source in (boot, iso):
+                pci_image = Image(executable(nextufs_binary), source)
+                pci_path = pci_image.bundle("PCIBus") + "/PCIBus_reloc"
+                pci_data = pci_image.read(pci_path)
+                if patch_pcibus_multifunction(pci_data) != pci_data:
+                    raise ValueError("unpatched PCIBus in boot or installer filesystem")
         removed_drivers = tuple(removed_drivers)
         target_drivers = tuple(dict.fromkeys(driver_name(name) for name in target_drivers))
         present = (set(DriverImage(boot, nextufs=nextufs_binary).list_drivers())
