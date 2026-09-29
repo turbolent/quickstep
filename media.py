@@ -2241,7 +2241,7 @@ fi
 
 def prepare_installer_disks(ufs: PathInput, output: PathInput, *, usb: bool = False,
                             nextufs_binary: PathInput | None = None) -> None:
-    """Prepare checked CD/USB destination selection and a bounded erase layout."""
+    """Prepare checked CD/USB selection and explicit, bounded 4 GiB volumes."""
     import installer
 
     with new_output(output, source=ufs) as staged:
@@ -2253,14 +2253,18 @@ def prepare_installer_disks(ufs: PathInput, output: PathInput, *, usb: bool = Fa
         if usb:
             expected = _patch_usb_installer(expected)
         mbr = installer.limited_layout(image.read("/usr/standalone/i386/boot1"))
-        mbr_entry = replace(entry, mode=stat.S_IFREG | 0o644, size=len(mbr))
-        image.write(installer.MBR_PATH, mbr, mbr_entry, False)
+        assets = ((installer.MBR_PATH, mbr, 0o644),
+                  (installer.HELPER_PATH, installer.layout_helper(), 0o644),
+                  (installer.DISK_PATH, installer.layout_disk(image.read('/usr/etc/disk')), 0o755))
+        for target, data, mode in assets:
+            image.write(target, data, replace(entry, mode=stat.S_IFREG | mode, size=len(data)), False)
         image.write(path, expected, entry, True)
         image.metadata("/private/etc", parent)
         if image.read(path) != expected:
             raise ValueError("installer script readback differs")
-        if image.read(installer.MBR_PATH) != mbr:
-            raise ValueError("installer partition layout readback differs")
+        for target, data, _ in assets:
+            if image.read(target) != data:
+                raise ValueError("installer partition asset readback differs: " + target)
         check_image(staged, nextufs_binary=nextufs_binary)
 
 
@@ -2989,6 +2993,12 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
         boot1 = nextufs("browse", "--raw", iso, "/usr/standalone/i386/boot1", binary=nextufs_binary)
         if nextufs("browse", "--raw", iso, installer.MBR_PATH, binary=nextufs_binary) != installer.limited_layout(boot1):
             raise ValueError("installer partition layout differs")
+        original_disk = nextufs("browse", "--raw", kernel_source or user_cd, "/usr/etc/disk", binary=nextufs_binary)
+        for path, expected in ((installer.DISK_PATH, installer.layout_disk(original_disk)),
+                               (installer.HELPER_PATH, installer.layout_helper()),
+                               ('/usr/etc/disk', original_disk)):
+            if nextufs("browse", "--raw", iso, path, binary=nextufs_binary) != expected:
+                raise ValueError("installer partition asset differs: " + path)
     installer = nextufs("browse", "--raw", iso, "/etc/rc.cdrom", binary=nextufs_binary)
     if installer != expected_script:
         raise ValueError("installer script differs from the prepared installation hook")

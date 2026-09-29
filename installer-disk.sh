@@ -8,6 +8,7 @@ DISK=quickstep_disk
 FDISK_FLAGS=
 QUICKSTEP_DISK_LIST=
 QUICKSTEP_FIXED_LAYOUT=no
+QUICKSTEP_VOLUMES=0
 
 quickstep_pickdisk() {
     disk_list=`${QUICKSTEP_PICKDISK} "$@"`
@@ -16,16 +17,7 @@ quickstep_pickdisk() {
     case "${1-}" in
         ''|0) QUICKSTEP_DISK_LIST="${disk_list}" ;;
     esac
-    echo "${disk_list}" | ${AWK} '
-        / - [0-9]+ MB$/ {
-            if ($(NF-1) > 4096) {
-                for (i = 1; i < NF-1; i++) printf "%s ", $i
-                print "4096 MB usable for OPENSTEP"
-                next
-            }
-        }
-        { print }
-    ' || return 255
+    echo "${disk_list}"
     return ${disk_status}
 }
 
@@ -35,7 +27,10 @@ quickstep_fdisk() {
 
 quickstep_disk() {
     case "$QUICKSTEP_FIXED_LAYOUT:${1-}" in
-        yes:-i|yes:-b)
+        yes:-i)
+            "${CDDIR}/layout-disk" -t quickstep -N -B0 /tmp/qsboot1 "$@" || return $?
+            /usr/bin/perl "${CDDIR}/installer-layout" verify "${livedisk}" "${CDDIR}/LayoutBoot1" ;;
+        yes:-b)
             # Native disk otherwise reinstalls boot0 on partitioned disks.
             # -B0 replaces the boot code while retaining the partition table.
             ${QUICKSTEP_DISK} -B0 /usr/standalone/i386/boot1 "$@" ;;
@@ -65,10 +60,32 @@ quickstep_physical_size() {
 }
 
 quickstep_write_layout() {
-    echo "Creating a 4 GiB OPENSTEP partition; remaining space will be unallocated."
-    # The asset includes zeros covering old labels in the reserved area.
-    /bin/dd if="${CDDIR}/MBR4GiB" of="${livedisk}" bs=512 count=66 || return 1
-    /bin/dd if="${livedisk}" bs=512 count=66 |
-        /bin/cmp - "${CDDIR}/MBR4GiB" || return 1
+    QUICKSTEP_VOLUMES=`/usr/bin/perl "${CDDIR}/installer-layout" prepare "${livedisk}" "${CDDIR}/LayoutBoot1"` || return 1
+    case "$QUICKSTEP_VOLUMES" in [1-7]) ;; *) return 1 ;; esac
+}
+
+quickstep_preview_layout() {
+    /usr/bin/perl "${CDDIR}/installer-layout" plan "${livedisk}"
+}
+
+quickstep_mount_local() {
+    case "$QUICKSTEP_VOLUMES" in 0|1) return 0 ;; [2-7]) ;; *) return 1 ;; esac
+    local_disk=`echo "$diskie" | ${SED} 's/a$//'`
+    ${MKDIRS} "${HD}/usr/local" || return 1
+    ${MOUNT} -n "/dev/${local_disk}b" "${HD}/usr/local"
+}
+
+quickstep_data_volumes() {
+    case "$QUICKSTEP_VOLUMES" in 0|1) return 0 ;; [2-7]) ;; *) return 1 ;; esac
+    data_disk=`echo "$diskie" | ${SED} 's/a$//'`
+    data_index=1
+    for data_letter in b c d e f g; do
+        if [ "$data_index" -ge "$QUICKSTEP_VOLUMES" ]; then break; fi
+        data_mount=/Data${data_index}
+        if [ "$data_index" -eq 1 ]; then data_mount=/usr/local; fi
+        ${MKDIRS} "${HD}${data_mount}" || return 1
+        echo "/dev/${data_disk}${data_letter} ${data_mount} 4.3 rw,noquota 0 2" >> "${HD}/private/etc/fstab" || return 1
+        data_index=`${EXPR} "$data_index" + 1` || return 1
+    done
 }
 # END quickstep disk limits

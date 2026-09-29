@@ -378,7 +378,7 @@ def build(boot_disk: PathInput, driver_disk: PathInput, beta_disk: PathInput | N
             media.prepare_setup_app(setup_app, installer, with_setup, catalog=catalog, fix_pic_bug=fix_pic_bug,
                                     nextufs_binary=nextufs_binary)
             installer = with_setup
-        print("Preparing destination disk limits and checked selection...", flush=True)
+        print("Preparing destination volumes (up to seven 4 GiB filesystems)...", flush=True)
         disk_installer = iso.parent / "disk-installer.ufs"
         media.prepare_installer_disks(installer, disk_installer, usb=usb, nextufs_binary=nextufs_binary)
         installer = disk_installer

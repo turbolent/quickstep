@@ -1,33 +1,61 @@
-"""Script-based OPENSTEP CD/USB installer limits; native utilities stay unchanged."""
+"""Explicit seven-volume OPENSTEP CD/USB erase layout and checked selection."""
 
+import hashlib
 from pathlib import Path
 import struct
 
 
-MBR_PATH = '/NextCD/MBR4GiB'
-LIMIT_SECTORS = 4 * 1024 * 1024 * 1024 // 512
-LAYOUT_SECTORS = 66
+MBR_PATH = '/NextCD/LayoutBoot1'
+HELPER_PATH = '/NextCD/installer-layout'
+DISK_PATH = '/NextCD/layout-disk'
 
 
 def limited_layout(boot1: bytes) -> bytes:
-    """Prepared MBR and cleared labels for one active NeXT partition below 4 GiB.
-
-    Start at LBA 2 (CHS 0/0/3), the same geometry-independent location used for
-    our USB source image. The entire NeXT extent ends at the 4 GiB boundary.
-    boot1 can read this table itself, so boot it directly without boot0's menu.
-    """
+    """Validate the boot template; runtime capacity determines the MBR extent."""
     if len(boot1) != 512 or boot1[510:] != b'\x55\xaa' or any(boot1[446:510]):
         raise ValueError('expected a 512-byte OPENSTEP boot1 with an empty partition table and MBR signature')
-    mbr = bytearray(boot1)
-    mbr[446:510] = b'\0' * 64
-    mbr[446:454] = bytes.fromhex('80000300a7feffff')
-    struct.pack_into('<II', mbr, 454, 2, LIMIT_SECTORS - 2)
-    # OPENSTEP has no /dev/zero. Supply the reserved-area zeros in the asset.
-    return bytes(mbr) + bytes((LAYOUT_SECTORS - 1) * 512)
+    return boot1
+
+
+def layout_helper() -> bytes:
+    return Path(__file__).with_name('installer-layout.pl').read_text(encoding='ascii').encode('ascii')
+
+
+def layout_disk(binary: bytes) -> bytes:
+    """Copy the known Intel disk utility, reading its map and boot sector from RAM.
+
+    The installed /usr/etc/disk and every instruction remain unchanged. Only
+    the copied utility's two input pathnames change; no compiler is needed.
+    With -t, disk bypasses the inference that normally preserves the MBR, and
+    ignores -B0 while writing its default boot1. That input must contain the
+    prepared partition table as well as boot code.
+    """
+    if binary[:4] == bytes.fromhex('cafebabe'):
+        if len(binary) < 8:
+            raise ValueError('truncated disk executable')
+        count = struct.unpack_from('>I', binary, 4)[0]
+        end = 8 + count * 20
+        if end > len(binary):
+            raise ValueError('truncated disk architecture table')
+        intel = [struct.unpack_from('>5I', binary, p) for p in range(8, end, 20)
+                 if struct.unpack_from('>I', binary, p)[0] == 7]
+        if len(intel) != 1:
+            raise ValueError('expected one Intel disk executable')
+        _, _, offset, size, _ = intel[0]
+        if offset < end or offset + size > len(binary):
+            raise ValueError('invalid disk architecture extent')
+        binary = binary[offset:offset + size]
+    if hashlib.sha256(binary).hexdigest() not in (
+        'aec5fa7501d2942cced00ad9c7fae46a36ffbcf1c840adbd0cf3fb9b83dee777',
+        'ceec81bb3b8f3fc9c52a587ab191f5d09eae1cd879bad879d3ca7e301f53e5e9',
+    ) or binary.count(b'/etc/disktab\0') != 1 or binary.count(b'/usr/standalone/i386/boot1\0') != 1:
+        raise ValueError('unsupported OPENSTEP disk executable')
+    return (binary.replace(b'/etc/disktab\0', b'/tmp/disktab\0')
+            .replace(b'/usr/standalone/i386/boot1\0', b'/tmp/qsboot1'.ljust(27, b'\0')))
 
 
 def patch_script(script: bytes) -> bytes:
-    """Offer a prepared erase layout on large disks without invoking fdisk."""
+    """Offer explicit 4 GiB volumes on every Intel destination, without fdisk."""
     if b'# BEGIN quickstep disk limits' in script:
         raise ValueError('installer already contains disk limits')
 
@@ -44,24 +72,22 @@ def patch_script(script: bytes) -> bytes:
 
 if [ "${ARCH}" = "i386" ]; then
     physicalsize=`quickstep_physical_size` || exit 1
-    if [ "$physicalsize" -gt 4096 ]; then
-        reply=""
-        while [ -z "$reply" ]; do
-            clear
-            echo "Type 1 to erase all partitions and use up to 4096 MB for OPENSTEP."
-            echo "The rest of the disk will remain unallocated."
-            echo "Type 2 for advanced partitioning using the original fdisk."
-            echo "Type 3 to quit without changing the disk."
-            echo -n "---> "
-            read reply
-            case "$reply" in
-                1) QUICKSTEP_FIXED_LAYOUT=yes ;;
-                2) ;;
-                3) exit 1 ;;
-                *) reply="" ;;
-            esac
-        done
-    fi
+    reply=""
+    while [ -z "$reply" ]; do
+        clear
+        quickstep_preview_layout || exit 1
+        echo "Type 1 to erase all partitions and create the volumes shown above."
+        echo "Type 2 for advanced partitioning using the original fdisk."
+        echo "Type 3 to quit without changing the disk."
+        echo -n "---> "
+        read reply
+        case "$reply" in
+            1) QUICKSTEP_FIXED_LAYOUT=yes ;;
+            2) ;;
+            3) exit 1 ;;
+            *) reply="" ;;
+        esac
+    done
 fi
 ''')
     edit(b'if [ "${ARCH}" = "i386" ]; then\n   reply=""',
@@ -84,11 +110,10 @@ fi
       choices=2
 ''')
     edit(b'FDISK_FLAGS="-removePartitioning" ;;', b'''FDISK_FLAGS="-removePartitioning"
-                        if [ "$physicalsize" -gt 4096 ]; then
-                            QUICKSTEP_FIXED_LAYOUT=yes
-                            FDISK_FLAGS=""
-                            break
-                        fi ;;''')
+                        QUICKSTEP_FIXED_LAYOUT=yes
+                        FDISK_FLAGS=""
+                        quickstep_preview_layout || exit 1
+                        break ;;''')
     edit(b'newsize=`${EXPR} $disksize - $resp2`', b'''case "$resp2" in
                                   ''|*[!0-9]*) continue ;;
                               esac
@@ -118,4 +143,11 @@ fi
 # Get off the disk before we initialize it!
 ''')
     edit(b'${DISK} -i $livedisk', b'${DISK} -i -u $livedisk')
+    # Mount before copying any packages, so /usr/local files land on volume b.
+    edit(b'${MOUNT} -n /dev/$diskie ${HD} >> /dev/null\n',
+         b'${MOUNT} -n /dev/$diskie ${HD} >> /dev/null || exit 1\n'
+         b'quickstep_mount_local || exit 1\n')
+    edit(b'echo "/dev/${diskie} / 4.3 rw,noquota,noauto 0 1" > ${HD}/private/etc/fstab\n',
+         b'echo "/dev/${diskie} / 4.3 rw,noquota,noauto 0 1" > ${HD}/private/etc/fstab\n'
+         b'quickstep_data_volumes || exit 1\n')
     return script

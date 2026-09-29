@@ -34,12 +34,26 @@ python3 build.py \
   --output openstep.iso
 ```
 
-Installation limits the OPENSTEP area to **4 GiB (4096 MB in the installer)**.
-On larger drives, erase mode removes all existing partitions and uses a prepared layout,
-leaving the remainder unallocated.
-It bypasses fdisk's BIOS geometry check while keeping the executable unchanged.
-OPENSTEP keeps its normal subdivision into filesystem volumes within that area.
-Advanced partitioning still uses stock fdisk.
+Erase mode creates **up to seven volumes of approximately 4 GiB each** instead
+of OPENSTEP's automatic 1 GiB subdivisions. The first volume is `/`, the second
+mounts as `/usr/local`, and the others as `/Data2` through `/Data6`.
+The installer mounts `/usr/local` before copying packages to it.
+A smaller final volume uses the remaining space, provided it is at least
+75 MiB. Each volume stays 128 KiB below
+4 GiB for compatibility with OPENSTEP's filesystem arithmetic.
+
+Before confirmation, the installer shows each volume's size and any space left
+unallocated. OPENSTEP reserves partition `h` for whole-disk access, so capacity
+beyond seven volumes (about 28 GiB) remains unallocated. Destination disks must
+use 512-byte sectors and expose fewer than 2^31 sectors through OPENSTEP's disk
+interface. Erase mode removes all existing partitions; it does not resize or
+migrate an installed system.
+
+The installer reads exact device capacity without fdisk's BIOS geometry check.
+A separate copy of the native disk utility reads an explicit volume map from
+the installer's RAM filesystem; the installed disk utility is unchanged.
+Advanced partitioning still uses stock fdisk and its original subdivision, with
+the existing 4 GiB limit on the selected OPENSTEP area.
 
 ### Optional flags
 
