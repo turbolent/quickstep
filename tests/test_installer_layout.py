@@ -33,9 +33,9 @@ class LayoutHelperTests(unittest.TestCase):
         self.helper = self.work / 'layout.pl'
         self.helper.write_bytes(installer.layout_helper())
 
-    def run_perl(self, code, *args):
+    def run_perl(self, code, *args, prelude=''):
         wrapper = self.work / 'test.pl'
-        wrapper.write_text('require "' + shell_path(self.helper) + '";\n' + code)
+        wrapper.write_text(prelude + '\nrequire "' + shell_path(self.helper) + '";\n' + code)
         return subprocess.run([self.perl, shell_path(wrapper), *map(str, args)],
                               capture_output=True, timeout=10)
 
@@ -160,9 +160,87 @@ class LayoutHelperTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(target.read_bytes(), b'untouched')
 
+    def test_prepare_works_when_file_creation_is_read_only(self):
+        bootfile = self.work / 'boot1'
+        bootfile.write_bytes(bytes(510) + b'\x55\xaa')
+        target = self.work / 'disk'
+        target.write_bytes(b'x' * (128 * 512))
+        mounts = self.work / 'mounts'
+        mounts.write_bytes(b'')
+        self.helper.write_text(self.helper.read_text().replace(
+            '"/usr/etc/mount |"', '"<' + shell_path(mounts) + '"'))
+        r = self.run_perl('''
+            *disk_sectors = sub { return 8388608; };
+            main();
+        ''', 'prepare', shell_path(target), shell_path(bootfile), prelude='''
+            sub CORE::GLOBAL::open (*;$) {
+                die "Read-only file system: $_[1]\\n" if $_[1] =~ /^>/;
+                return CORE::open($_[0], $_[1]);
+            }
+        ''')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, b'1\n')
+        data = target.read_bytes()
+        self.assertEqual(data[446:454], bytes.fromhex('80000300a7feffff'))
+        self.assertEqual(struct.unpack_from('<II', data, 454), (2, 8388606))
+        self.assertEqual(data[510:512], b'\x55\xaa')
+        self.assertEqual(data[512:66*512], bytes(65*512))
+        self.assertEqual(data[66*512:], b'x' * (62*512))
+
+    def test_formatter_receives_pipe_and_reports_exec_or_child_failure(self):
+        formatter = self.work / 'formatter'
+        for status in (0, 7, None):
+            with self.subTest(status=status):
+                if status is None:
+                    formatter.unlink()
+                else:
+                    formatter.write_text('#!/usr/bin/perl\n'
+                        'print join(" ", @ARGV), "\\n";\n'
+                        'print while <STDIN>;\nexit ' + str(status) + ';\n')
+                    formatter.chmod(0o755)
+                r = self.run_perl('''
+                    *disk_sectors = sub { return 500118192; };
+                    main(); print "DONE\\n";
+                ''', 'format', '/dev/rsd0h', shell_path(formatter))
+                self.assertEqual(r.returncode == 0, status == 0, r.stderr)
+                self.assertEqual(b'DONE\n' in r.stdout, status == 0)
+                if status is not None:
+                    expected = self.run_perl('print disktab(layout(500118192));')
+                    self.assertEqual(r.stdout, b'-t quickstep -N -i -u /dev/rsd0h\n'
+                                     + expected.stdout + (b'DONE\n' if status == 0 else b''))
+                else:
+                    self.assertIn(b'Cannot execute disk formatter', r.stderr)
+
 
 class NativeDiskCopyTests(unittest.TestCase):
-    def test_known_disk_copy_changes_only_the_input_paths(self):
+    def load_disk(self):
+        source = os.environ.get('INSTALLER_TEST_DISK')
+        if not source or unicorn is None:
+            self.skipTest('INSTALLER_TEST_DISK and Unicorn required')
+        binary = installer.layout_disk(Path(source).read_bytes())
+        uc = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        uc.mem_map(0x1000, 0x100000)
+        uc.mem_map(0x1000000, 0x10000)
+        pos = 28
+        for _ in range(struct.unpack_from('<I', binary, 16)[0]):
+            command, size = struct.unpack_from('<II', binary, pos)
+            if command == 1:
+                _, _, _, va, _, off, length, *_ = struct.unpack_from('<II16s8I', binary, pos)
+                if length:
+                    uc.mem_write(va, binary[off:off+length])
+            elif command == 2:
+                symoff, count, stroff, _ = struct.unpack_from('<4I', binary, pos+8)
+            pos += size
+        symbols = {}
+        for i in range(count):
+            index, kind, _, _, value = struct.unpack_from('<IBBHI', binary, symoff+12*i)
+            if kind & 0xe0 or not value:
+                continue
+            name = binary[stroff+index:binary.index(b'\0', stroff+index)].decode('ascii')
+            symbols[name] = value
+        return uc, symbols
+
+    def test_known_disk_copy_changes_only_two_instructions(self):
         path = os.environ.get('INSTALLER_TEST_DISK')
         if not path:
             self.skipTest('INSTALLER_TEST_DISK required')
@@ -174,9 +252,12 @@ class NativeDiskCopyTests(unittest.TestCase):
                 if cpu == 7:
                     thin = source[offset:offset+size]
         copied = installer.layout_disk(source)
-        restored = (copied.replace(b'/tmp/disktab\0', b'/etc/disktab\0')
-                    .replace(b'/tmp/qsboot1'.ljust(27, b'\0'), b'/usr/standalone/i386/boot1\0'))
-        self.assertEqual(restored, thin)
+        self.assertEqual(len(copied), len(thin))
+        changed = [i for i, (old, new) in enumerate(zip(thin, copied)) if old != new]
+        self.assertEqual(len(changed), 9)
+        self.assertEqual(changed[-1] - changed[-5], 4)  # Five-byte open call.
+        self.assertNotIn(b'/tmp/disktab', copied)
+        self.assertNotIn(b'/tmp/qsboot1', copied)
         self.assertEqual(installer.layout_disk(thin), copied)
         with self.assertRaises(ValueError):
             installer.layout_disk(thin[:-1] + bytes([thin[-1] ^ 1]))
@@ -192,7 +273,6 @@ class NativeDiskCopyTests(unittest.TestCase):
         perl = 'C:/msys64/usr/bin/perl.exe' if os.name == 'nt' else shutil.which('perl')
         if not source or unicorn is None or not perl:
             self.skipTest('INSTALLER_TEST_DISK, Unicorn and Perl required')
-        binary = installer.layout_disk(Path(source).read_bytes())
         # Run the real Intel disk utility's parser and label constructor. Only
         # its three file syscalls are intercepted; parsing and arithmetic run
         # unmodified, including the 1024-byte disktab entry buffer.
@@ -203,48 +283,27 @@ class NativeDiskCopyTests(unittest.TestCase):
                                     str(sectors)], capture_output=True, timeout=10)
                 self.assertEqual(r.returncode, 0, r.stderr)
                 table = r.stdout
-                uc = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
-                uc.mem_map(0x1000, 0x100000)
-                uc.mem_map(0x1000000, 0x10000)
-                pos = 28
-                for _ in range(struct.unpack_from('<I', binary, 16)[0]):
-                    command, size = struct.unpack_from('<II', binary, pos)
-                    if command == 1:
-                        _, _, _, va, _, off, length, *_ = struct.unpack_from('<II16s8I', binary, pos)
-                        if length:
-                            uc.mem_write(va, binary[off:off+length])
-                    elif command == 2:
-                        symoff, count, stroff, _ = struct.unpack_from('<4I', binary, pos+8)
-                    pos += size
-                symbols = {}
-                for i in range(count):
-                    index, kind, _, _, value = struct.unpack_from('<IBBHI', binary, symoff+12*i)
-                    if kind & 0xe0 or not value:
-                        continue
-                    name = binary[stroff+index:binary.index(b'\0', stroff+index)].decode('ascii')
-                    symbols[name] = value
+                uc, symbols = self.load_disk()
                 def word(address):
                     return struct.unpack('<I', uc.mem_read(address, 4))[0]
                 def put(address, value):
                     uc.mem_write(address, struct.pack('<I', value))
                 cursor = 0
-                opens = []
+                closes = []
                 def hook(machine, address, size, _):
                     nonlocal cursor
                     sp = machine.reg_read(x86.UC_X86_REG_ESP)
                     if address == symbols['_open']:
-                        pointer = word(sp+4)
-                        path = bytes(machine.mem_read(pointer, 32)).split(b'\0')[0]
-                        opens.append(path)
-                        self.assertEqual(path, b'/tmp/disktab')
-                        value = 10
+                        self.fail('disktab parser attempted to open a file')
                     elif address == symbols['_read']:
-                        self.assertEqual(word(sp+4), 10)
-                        data = table[cursor:cursor+word(sp+12)]
+                        self.assertEqual(word(sp+4), 0)
+                        # Pipes may return less than the requested buffer size.
+                        data = table[cursor:cursor+min(word(sp+12), 17)]
                         machine.mem_write(word(sp+8), data)
                         cursor += len(data)
                         value = len(data)
                     elif address == symbols['_close']:
+                        closes.append(word(sp+4))
                         value = 0
                     else:
                         return
@@ -263,7 +322,7 @@ class NativeDiskCopyTests(unittest.TestCase):
                 dt = call('_getdiskbyname', 0xf0000)
                 self.assertNotEqual(dt, 0)
                 self.assertEqual(word(dt+0x30), 1024)
-                self.assertEqual(opens, [b'/tmp/disktab'])
+                self.assertEqual(closes, [0])
                 put(symbols['_dt'], dt)
                 call('_make_new_label')
                 label = symbols['_disk_label']
@@ -280,6 +339,93 @@ class NativeDiskCopyTests(unittest.TestCase):
                     self.assertEqual(word(p), int(fields.get(b'p'+key, -1)) & 0xffffffff)
                     self.assertEqual(word(p+4), expected_size & 0xffffffff)
                     self.assertEqual(uc.mem_read(p+19, 1)[0], int(expected_size > 0))
+
+                # EOF from a failed producer must reject the layout.
+                table = b''
+                cursor = 0
+                self.assertEqual(call('_getdiskbyname', 0xf0000), 0)
+
+    def test_native_secondary_loaders_are_written_without_overwriting_mbr(self):
+        uc, symbols = self.load_disk()
+        boot = b'loader!!' * 1024
+        disk = bytearray(b'x' * (256 * 1024))
+        original = bytes(disk)
+        cursor = 0
+        writes = []
+        opens = []
+
+        def word(address):
+            return struct.unpack('<I', uc.mem_read(address, 4))[0]
+
+        def put(address, value):
+            uc.mem_write(address, struct.pack('<I', value))
+
+        def hook(machine, address, size, _):
+            nonlocal cursor
+            sp = machine.reg_read(x86.UC_X86_REG_ESP)
+            if address == symbols['_malloc']:
+                value = 0x80000
+            elif address in (symbols['_free'], symbols['_printf'], symbols['_close']):
+                value = 0
+            elif address in (symbols['_bomb'], symbols['_dpanic']):
+                self.fail('native boot writer rejected the prepared layout')
+            elif address == symbols['_open']:
+                path = bytes(machine.mem_read(word(sp+4), 64)).split(b'\0')[0]
+                opens.append(path)
+                self.assertEqual(path, b'/secondary-loader')
+                value = 10
+            elif address == symbols['_read']:
+                self.assertEqual(word(sp+4), 10)
+                data = boot[cursor:cursor+word(sp+12)]
+                machine.mem_write(word(sp+8), data)
+                cursor += len(data)
+                value = len(data)
+            elif address == symbols['_lseek']:
+                self.assertEqual((word(sp+4), word(sp+8), word(sp+12)), (10, 0, 0))
+                cursor = value = 0
+            elif address == 0xf2100:  # Driver's read-label callback.
+                value = 0
+            elif address == 0xf2200:  # Driver's read/write callback.
+                self.assertEqual(word(sp+4), 2)  # CMD_WRITE
+                block, pointer, length = (word(sp+i) for i in (8, 12, 16))
+                writes.append(block)
+                disk[block*512:block*512+length] = machine.mem_read(pointer, length)
+                value = 0
+            else:
+                return
+            machine.reg_write(x86.UC_X86_REG_EAX, value)
+            machine.reg_write(x86.UC_X86_REG_EIP, word(sp))
+            machine.reg_write(x86.UC_X86_REG_ESP, sp+4)
+
+        uc.hook_add(unicorn.UC_HOOK_CODE, hook)
+        uc.mem_write(0xf3000, b'/secondary-loader\0')
+        put(symbols['_bootfile'], 0xf3000)
+        put(symbols['_do_boot'], 1)
+        put(symbols['_do_boot0'], 1)
+        put(symbols['_do_boot1'], 1)
+        put(symbols['_dosdisk'], 0)  # -t bypasses DOS partition inference.
+        put(symbols['_dosbase'], 0)
+        put(symbols['_interactive'], 0)
+        put(symbols['_devblklen'], 512)
+        put(symbols['_dsp'], 0xf2000)
+        put(0xf2028, 0xf2100)
+        put(0xf2010, 0xf2200)
+        label = symbols['_disk_label']
+        put(label+44+0x30, 1024)
+        uc.mem_write(label+44+0x44, struct.pack('<H', 160))
+        put(label+44+0x50, 33)
+        put(label+44+0x54, 97)
+        put(0x100f000, 0xf1000)
+        uc.reg_write(x86.UC_X86_REG_ESP, 0x100f000)
+        uc.emu_start(symbols['_boot'], 0xf1000, count=1000000)
+        self.assertEqual(uc.reg_read(x86.UC_X86_REG_EIP), 0xf1000)
+        self.assertEqual(uc.reg_read(x86.UC_X86_REG_EAX), 0)
+        self.assertEqual(opens, [b'/secondary-loader'])
+        self.assertEqual(writes, [66, 194])
+        expected = bytearray(original)
+        for block in (66, 194):
+            expected[block*512:block*512+len(boot)] = boot
+        self.assertEqual(disk, expected)
 
 
 if __name__ == '__main__':

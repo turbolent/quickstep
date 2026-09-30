@@ -9,6 +9,21 @@ MBR_PATH = '/NextCD/LayoutBoot1'
 HELPER_PATH = '/NextCD/installer-layout'
 DISK_PATH = '/NextCD/layout-disk'
 
+# File offsets for the two supported Intel executables (stock and Patch 4).
+# _dgetent: replace open("/etc/disktab", 0) with fd 0; it still reads/closes it.
+# _boot: skip the boot1 write, which would overwrite the already prepared MBR
+# when -t bypasses partition inference. The secondary loaders remain enabled.
+_DISK_STREAM_PATCHES = {
+    'aec5fa7501d2942cced00ad9c7fae46a36ffbcf1c840adbd0cf3fb9b83dee777': (
+        (0x5ad4, bytes.fromhex('e8039b0000'), bytes.fromhex('31c0909090')),
+        (0x3985, bytes.fromhex('0f84a1000000'), bytes.fromhex('e9a200000090')),
+    ),
+    'ceec81bb3b8f3fc9c52a587ab191f5d09eae1cd879bad879d3ca7e301f53e5e9': (
+        (0x58dc, bytes.fromhex('e8fb9c0000'), bytes.fromhex('31c0909090')),
+        (0x378d, bytes.fromhex('0f84a1000000'), bytes.fromhex('e9a200000090')),
+    ),
+}
+
 
 def limited_layout(boot1: bytes) -> bytes:
     """Validate the boot template; runtime capacity determines the MBR extent."""
@@ -22,13 +37,11 @@ def layout_helper() -> bytes:
 
 
 def layout_disk(binary: bytes) -> bytes:
-    """Copy the known Intel disk utility, reading its map and boot sector from RAM.
+    """Copy the known Intel disk utility for initialization from read-only media.
 
-    The installed /usr/etc/disk and every instruction remain unchanged. Only
-    the copied utility's two input pathnames change; no compiler is needed.
-    With -t, disk bypasses the inference that normally preserves the MBR, and
-    ignores -B0 while writing its default boot1. That input must contain the
-    prepared partition table as well as boot code.
+    Read the explicit disktab from stdin and retain the MBR written by prepare.
+    Only the installer copy is patched; /usr/etc/disk stays unchanged. This copy
+    is used exclusively with -t quickstep -N -i -u, without console input.
     """
     if binary[:4] == bytes.fromhex('cafebabe'):
         if len(binary) < 8:
@@ -45,13 +58,15 @@ def layout_disk(binary: bytes) -> bytes:
         if offset < end or offset + size > len(binary):
             raise ValueError('invalid disk architecture extent')
         binary = binary[offset:offset + size]
-    if hashlib.sha256(binary).hexdigest() not in (
-        'aec5fa7501d2942cced00ad9c7fae46a36ffbcf1c840adbd0cf3fb9b83dee777',
-        'ceec81bb3b8f3fc9c52a587ab191f5d09eae1cd879bad879d3ca7e301f53e5e9',
-    ) or binary.count(b'/etc/disktab\0') != 1 or binary.count(b'/usr/standalone/i386/boot1\0') != 1:
+    changes = _DISK_STREAM_PATCHES.get(hashlib.sha256(binary).hexdigest())
+    if changes is None:
         raise ValueError('unsupported OPENSTEP disk executable')
-    return (binary.replace(b'/etc/disktab\0', b'/tmp/disktab\0')
-            .replace(b'/usr/standalone/i386/boot1\0', b'/tmp/qsboot1'.ljust(27, b'\0')))
+    result = bytearray(binary)
+    for offset, before, after in changes:
+        if binary[offset:offset + len(before)] != before:
+            raise ValueError('unsupported OPENSTEP disk instructions')
+        result[offset:offset + len(before)] = after
+    return bytes(result)
 
 
 def patch_script(script: bytes) -> bytes:

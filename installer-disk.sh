@@ -28,7 +28,7 @@ quickstep_fdisk() {
 quickstep_disk() {
     case "$QUICKSTEP_FIXED_LAYOUT:${1-}" in
         yes:-i)
-            "${CDDIR}/layout-disk" -t quickstep -N -B0 /tmp/qsboot1 "$@" || return $?
+            /usr/bin/perl "${CDDIR}/installer-layout" format "${livedisk}" "${CDDIR}/layout-disk" || return $?
             /usr/bin/perl "${CDDIR}/installer-layout" verify "${livedisk}" "${CDDIR}/LayoutBoot1" ;;
         yes:-b)
             # Native disk otherwise reinstalls boot0 on partitioned disks.

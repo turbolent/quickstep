@@ -120,22 +120,22 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.stdout, 'sd0a\n')
 
     def test_native_boot_writes_keep_boot1_only_for_the_prepared_layout(self):
-        native = self.work / 'layout-disk'
-        native.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit 7\n')
-        native.chmod(0o755)
+        self.helper = self.helper.replace('/usr/bin/perl', 'test_perl')
+        prefix = '''native_disk() { printf "%s\\n" "$@"; return 7; }
+            test_perl() { shift; printf "%s\\n" "$@"; return 7; }'''
         for fixed in ('yes', 'no'):
             for action in ('-i', '-b', '-e'):
                 with self.subTest(fixed=fixed, action=action):
-                    result = self.run_shell('native_disk() { printf "%s\\n" "$@"; return 7; }',
+                    result = self.run_shell(prefix,
                                             f'CDDIR="{shell_path(self.work)}"\nQUICKSTEP_FIXED_LAYOUT={fixed}\n'
+                                            'livedisk="/dev/disk name"\n'
                                             f'${{DISK}} {action} "/dev/disk name"')
                     self.assertEqual(result.returncode, 7, result.stderr)
                     expected = f'{action}\n/dev/disk name\n'
-                    if fixed == 'yes' and action in ('-i', '-b'):
+                    if fixed == 'yes' and action == '-b':
                         expected = '-B0\n/usr/standalone/i386/boot1\n' + expected
                     if fixed == 'yes' and action == '-i':
-                        expected = '-t\nquickstep\n-N\n' + expected
-                        expected = expected.replace('/usr/standalone/i386/boot1', '/tmp/qsboot1')
+                        expected = f'format\n/dev/disk name\n{shell_path(self.work)}/layout-disk\n'
                     self.assertEqual(result.stdout, expected)
 
     def test_failed_empty_and_invalid_inquiries_never_reach_numeric_test(self):
@@ -158,16 +158,21 @@ class ShellTests(unittest.TestCase):
 
     def test_post_format_verification_failure_stops_installation(self):
         self.helper = self.helper.replace('/usr/bin/perl', 'test_perl')
-        native = self.work / 'layout-disk'
-        native.write_text('#!/bin/sh\nexit 0\n')
-        native.chmod(0o755)
         for status in (0, 1):
-            result = self.run_shell('test_perl() { echo "$2"; return ' + str(status) + '; }',
+            result = self.run_shell('test_perl() { echo "$2"; [ "$2" != verify ] || return ' + str(status) + '; }',
                 f'CDDIR="{shell_path(self.work)}"\nlivedisk=/dev/rsd0h\n'
                 'QUICKSTEP_FIXED_LAYOUT=yes\n${DISK} -i -u "$livedisk" || exit 1\necho CONTINUE')
             self.assertEqual(result.returncode, status, result.stderr)
             self.assertIn('verify', result.stdout)
             self.assertEqual('CONTINUE' in result.stdout, status == 0)
+
+    def test_formatter_failure_stops_before_verification_or_mounting(self):
+        self.helper = self.helper.replace('/usr/bin/perl', 'test_perl')
+        result = self.run_shell('test_perl() { echo "$2"; return 7; }',
+            'CDDIR=/NextCD\nlivedisk=/dev/rsd0h\nQUICKSTEP_FIXED_LAYOUT=yes\n'
+            '${DISK} -i -u "$livedisk" || exit $?\necho MOUNT')
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stdout, 'format\n')
 
     def test_data_volumes_get_mountpoints_and_fstab_entries(self):
         target = self.work / 'target'

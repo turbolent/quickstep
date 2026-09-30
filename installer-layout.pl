@@ -112,11 +112,27 @@ sub verify_layout {
     }
 }
 
+sub format_layout {
+    local($device, $formatter, @sizes) = @_;
+    # The CD/USB root, including /tmp, is read-only. Feed the native parser
+    # through an anonymous pipe; no temporary files or /dev/fd are required.
+    local($pid) = open(FORMAT, "|-");
+    defined($pid) or die "Cannot start disk formatter: $!\n";
+    if (!$pid) {
+        exec($formatter, "-t", "quickstep", "-N", "-i", "-u", $device);
+        die "Cannot execute disk formatter: $!\n";
+    }
+    local($SIG{'PIPE'}) = 'IGNORE';
+    local($written) = print FORMAT &disktab(@sizes);
+    local($finished) = close(FORMAT);
+    $written && $finished or die "Disk formatter failed\n";
+}
+
 sub main {
     local($mode, $device, $bootpath) = @ARGV;
     defined($device) && (($mode eq "plan" && @ARGV == 2) ||
-        (($mode eq "prepare" || $mode eq "verify") && @ARGV == 3))
-        or die "Usage: installer-layout plan raw-disk | prepare|verify raw-disk boot1\n";
+        (($mode eq "prepare" || $mode eq "verify" || $mode eq "format") && @ARGV == 3))
+        or die "Usage: installer-layout plan raw-disk | prepare|verify raw-disk boot1 | format raw-disk formatter\n";
     local($sectors) = &disk_sectors($device);
     local(@sizes) = &layout($sectors);
     if ($mode eq "plan") {
@@ -128,6 +144,10 @@ sub main {
             $i++;
         }
         printf "Space left unallocated: %.2f MiB\n", ($sectors - $used) / 2048;
+        return;
+    }
+    if ($mode eq "format") {
+        &format_layout($device, $bootpath, @sizes);
         return;
     }
     open(BOOT, "<$bootpath") or die "Cannot read boot1: $!\n";
@@ -152,24 +172,8 @@ sub main {
     while (<MOUNTS>) { $mounted = 1 if m|^/dev/${name}[a-g] on |; }
     close(MOUNTS) or die "Cannot inspect mounted disks\n";
     !$mounted or die "Refusing to erase mounted disk $device\n";
-    # /tmp is the installer's RAM filesystem. Never follow an existing link.
-    local($table) = "/tmp/disktab";
-    local($bootsector) = "/tmp/qsboot1";
-    foreach $file ($table, $bootsector) {
-        !-e $file && !-l $file or die "$file already exists; restart installation\n";
-    }
-    local($oldmask) = umask(077);
-    open(TABLE, ">$table") or die "Cannot create $table: $!\n";
-    print TABLE &disktab(@sizes) or die "Cannot write $table: $!\n";
-    close(TABLE) or die "Cannot close $table: $!\n";
-    # With -t, native disk bypasses geometry inference and does not retain the
-    # MBR table while installing boot0. The copied utility reads this prepared
-    # boot sector, so the newfs calls inside disk -i see the NeXT partition.
-    open(BOOTSECTOR, ">$bootsector") or die "Cannot create $bootsector: $!\n";
-    binmode(BOOTSECTOR);
-    print BOOTSECTOR substr($data, 0, 512) or die "Cannot write boot sector: $!\n";
-    close(BOOTSECTOR) or die "Cannot close boot sector: $!\n";
-    umask($oldmask);
+    # The copied formatter preserves this MBR while creating labels, secondary
+    # loaders and filesystems. All preparation writes go to the confirmed disk.
     open(TARGET, "+<$device") or die "Cannot open destination: $!\n";
     binmode(TARGET);
     &write_layout(TARGET, $data);
