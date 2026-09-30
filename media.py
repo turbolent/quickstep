@@ -660,8 +660,12 @@ class DriverImage:
 
 # Reusable image preparation and OPENSTEP/El Torito ISO construction.
 # Boot-CD workflow limits in KiB, including the front porch; not general UFS limits.
-MAX_GROWN_FLOPPY_KIB = 2560
 MAX_BOOT_FLOPPY_KIB = 2880
+_FLOPPY_OLD_FRONT = 64 * 1024
+_FLOPPY_WC_FRONT = 80 * 1024
+# Use the boot image's capacity, reserving only the extra front porch needed
+# when copy_bootloader relocates UFS for Patch 4's larger VBE bootloader.
+MAX_GROWN_FLOPPY_KIB = MAX_BOOT_FLOPPY_KIB - (_FLOPPY_WC_FRONT - _FLOPPY_OLD_FRONT) // 1024
 
 
 def _subprocess_env(nextufs_binary: PathInput | None = None) -> dict[str, str] | None:
@@ -846,8 +850,6 @@ def verify_framebuffer_wc(image: PathInput, *, nextufs_binary: PathInput | None 
 
 
 _FLOPPY_LABELS = (7680, 15360, 23040)
-_FLOPPY_OLD_FRONT = 64 * 1024
-_FLOPPY_WC_FRONT = 80 * 1024
 _FLOPPY_LOADER_OFFSET = 32 * 1024
 _FLOPPY_LOADER_LIMIT = 88 * 512
 _FLOPPY_FIRST_SHA256 = "b62b0a4ce0e5f4230a5a13268b79287c1a27006c08404cc8bb12a9e99440be14"
