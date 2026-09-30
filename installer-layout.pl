@@ -2,6 +2,8 @@
 # OPENSTEP 4.2's system Perl 5. Plans seven native UFS volumes, then lets
 # the native disk/newfs utilities initialize them from an explicit disktab.
 # plan is read-only; prepare is called only after rc.cdrom's erase confirmation.
+# Capacity, layout() sizes and the MBR use 512-byte device sectors. The NeXT
+# label uses 1024-byte logical sectors to avoid OPENSTEP's buffer-cache bug.
 
 sub layout {
     local($sectors) = @_;
@@ -27,7 +29,7 @@ sub disk_sectors {
     open(CAPACITY, "<$device") or die "Cannot open $device: $!\n";
     local($word) = pack("L", 0);
     ioctl(CAPACITY, 0x40046418, $word) or die "Cannot read sector size: $!\n";
-    unpack("L", $word) == 512 or die "Only 512-byte destination sectors are supported\n";
+    unpack("L", $word) == 512 or die "Only 512-byte device sectors are supported\n";
     ioctl(CAPACITY, 0x40046419, $word) or die "Cannot read sector count: $!\n";
     local($sectors) = unpack("L", $word);
     close(CAPACITY) or die "Cannot close $device: $!\n";
@@ -37,15 +39,18 @@ sub disk_sectors {
 
 sub disktab {
     local(@sizes) = @_;
-    local($end, $base, $i, $letter, $text) = (322, 2, 0);
+    local($end, $base, $i, $letter, $text, $logical_size) = (322, 1, 0);
     foreach $size (@sizes) { $end += $size; }
     $text = "quickstep|Quickstep installation:\\\n";
-    $text .= "\t:ty=fixed_rw_scsi:ss#512:nt#64:ns#32:nc#" . int(($end + 2047) / 2048) . ":rm#3600:\\\n";
-    $text .= "\t:fp#320:bp#0:ng#0:gs#0:ga#0:ao#0:os=mach_kernel:z0#66:z1#194:ro=a:rw=a:\\\n";
+    # Halve every sector-valued field, retaining the same byte geometry:
+    # 1 MiB cylinders, 160 KiB front porch, loaders at 33 KiB and 97 KiB.
+    $text .= "\t:ty=fixed_rw_scsi:ss#1024:nt#64:ns#16:nc#" . int(($end + 2047) / 2048) . ":rm#3600:\\\n";
+    $text .= "\t:fp#160:bp#0:ng#0:gs#0:ga#0:ao#0:os=mach_kernel:z0#33:z1#97:ro=a:rw=a:\\\n";
     foreach $size (@sizes) {
+        $logical_size = $size / 2;
         $letter = substr("abcdefg", $i++, 1);
-        $text .= "\t:p$letter#$base:s$letter#$size:b$letter#8192:f$letter#1024:c$letter#16:d$letter#4096:r$letter#10:o$letter=time:i$letter:t$letter=4.3BSD:\\\n";
-        $base += $size;
+        $text .= "\t:p$letter#$base:s$letter#$logical_size:b$letter#8192:f$letter#1024:c$letter#16:d$letter#4096:r$letter#10:o$letter=time:i$letter:t$letter=4.3BSD:\\\n";
+        $base += $logical_size;
     }
     # Missing numeric capabilities become -1. The native parser does not
     # accept a minus sign in '#-1'; explicitly writing that would become zero.
@@ -81,19 +86,22 @@ sub verify_layout {
     seek($handle, 0, 0) && read($handle, $actual, 512) == 512 &&
         $actual eq substr($expected, 0, 512)
         or die "Formatter changed the prepared MBR\n";
+    # Label copy locations remain in physical 512-byte sectors.
     foreach $block (17, 32, 47) {
         seek($handle, $block * 512, 0) && read($handle, $actual, 1024) == 1024
             or die "Cannot read formatted disk label\n";
         substr($actual, 0, 4) eq 'dlV3' &&
-            unpack('N', substr($actual, 0x5c, 4)) == 512 &&
-            unpack('n', substr($actual, 0x70, 2)) == 320 &&
+            unpack('N', substr($actual, 0x5c, 4)) == 1024 &&
+            unpack('n', substr($actual, 0x70, 2)) == 160 &&
+            unpack('N', substr($actual, 0x7c, 4)) == 33 &&
+            unpack('N', substr($actual, 0x80, 4)) == 97 &&
             substr($actual, 0xbc, 1) eq 'a'
             or die "Unexpected formatted disk label\n";
-        $base = 2;
+        $base = 1;
         for ($i = 0; $i < 8; $i++) {
             ($offset, $size) = unpack('N2', substr($actual, 0xbe + 46 * $i, 8));
             if ($i < @sizes) {
-                $offset == $base && $size == $sizes[$i]
+                $offset == $base && $size * 2 == $sizes[$i]
                     or die "Formatter changed volume " . substr('abcdefgh', $i, 1) . "\n";
                 $base += $size;
             } else {

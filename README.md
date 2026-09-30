@@ -45,9 +45,10 @@ A smaller final volume uses the remaining space, provided it is at least
 Before confirmation, the installer shows each volume's size and any space left
 unallocated. OPENSTEP reserves partition `h` for whole-disk access, so capacity
 beyond seven volumes (about 28 GiB) remains unallocated. Destination disks must
-use 512-byte sectors and expose fewer than 2^31 sectors through OPENSTEP's disk
-interface. Erase mode removes all existing partitions; it does not resize or
-migrate an installed system.
+report 512-byte device sectors and expose fewer than 2^31 sectors through
+OPENSTEP's disk interface. Erase mode creates **1024-byte logical sectors**
+in the NeXT disk label, translated onto those device sectors. This avoids the
+stock kernel's buffer-cache overlap bug with 512-byte logical sectors.
 
 The installer reads exact device capacity without fdisk's BIOS geometry check.
 A separate copy of the native disk utility reads an explicit volume map from

@@ -41,7 +41,8 @@ class LayoutHelperTests(unittest.TestCase):
 
     def test_boundaries_and_volume_accounting(self):
         limit = 4 * 1024**3 // 512 - 256
-        for sectors, expected in ((153922, [153600]), (2**21, [2**21 - 322]),
+        for sectors, expected in ((153922, [153600]), (153923, [153600]),
+                                  (2**21, [2**21 - 322]), (2**21 + 1, [2**21 - 322]),
                                   (2**23, [2**23 - 322]), (2**24, [limit, limit]),
                                   (10 * 2**21, [limit, limit, 10 * 2**21 - 322 - 2 * limit]),
                                   (limit + 322 + 153599, [limit]),
@@ -76,8 +77,14 @@ class LayoutHelperTests(unittest.TestCase):
             table = r.stdout.decode()
             self.assertLess(len(table), 1024)  # Native getdiskbyname's entry buffer.
             fields = dict(re.findall(r':([a-z][a-z0-9])#(-?\d+)', table))
+            sector_size = int(fields['ss'])
+            self.assertEqual(sector_size, 1024)
             front = int(fields['fp'])
-            end = 2
+            self.assertEqual(front * sector_size, 160 * 1024)
+            self.assertEqual(int(fields['nt']) * int(fields['ns']) * sector_size, 1024**2)
+            self.assertEqual(int(fields['z0']) * sector_size, 66 * 512)
+            self.assertEqual(int(fields['z1']) * sector_size, 194 * 512)
+            end = 1
             count = 0
             for letter in 'abcdefgh':
                 base, size = int(fields.get('p' + letter, -1)), int(fields.get('s' + letter, -1))
@@ -87,6 +94,7 @@ class LayoutHelperTests(unittest.TestCase):
                 self.assertEqual(base, end)
                 self.assertEqual(int(fields['b' + letter]), 8192)
                 self.assertEqual(int(fields['f' + letter]), 1024)
+                self.assertEqual(int(fields['d' + letter]), 4096)
                 self.assertIn(':i' + letter + ':', table)
                 end += size
                 count += 1
@@ -97,7 +105,7 @@ class LayoutHelperTests(unittest.TestCase):
             self.assertEqual(data[446:454], bytes.fromhex('80000300a7feffff'))
             start, length = struct.unpack_from('<II', data, 454)
             self.assertEqual(start, 2)
-            self.assertEqual(start + length, front + end)
+            self.assertEqual((start + length) * 512, (front + end) * sector_size)
             self.assertLessEqual(start + length, sectors)
             self.assertEqual(data[462:510], bytes(48))
             self.assertEqual(data[510:512], b'\x55\xaa')
@@ -124,14 +132,16 @@ class LayoutHelperTests(unittest.TestCase):
         for block in (17, 32, 47):
             start = block * 512
             data[start:start+4] = b'dlV3'
-            struct.pack_into('>I', data, start+0x5c, 512)
-            struct.pack_into('>H', data, start+0x70, 320)
+            struct.pack_into('>I', data, start+0x5c, 1024)
+            struct.pack_into('>H', data, start+0x70, 160)
+            struct.pack_into('>II', data, start+0x7c, 33, 97)
             data[start+0xbc] = ord('a')
             for i in range(8):
                 struct.pack_into('>ii', data, start+0xbe+46*i,
-                                 2+8388352*i if i < 7 else -1, 8388352 if i < 7 else -1)
+                                 1+4194176*i if i < 7 else -1, 4194176 if i < 7 else -1)
         disk = self.work / 'formatted'
-        for offset in (None, 446, 17*512, 32*512+0xbe+46*4, 47*512+0xbe+46*7):
+        for offset in (None, 446, 17*512, 17*512+0x5c, 17*512+0x70,
+                       17*512+0x7c, 17*512+0x80, 32*512+0xbe+46*4, 47*512+0xbe+46*7):
             damaged = bytearray(data)
             if offset is not None:
                 damaged[offset] ^= 1
@@ -252,10 +262,12 @@ class NativeDiskCopyTests(unittest.TestCase):
                 uc.mem_write(0xf0000, b'quickstep\0')
                 dt = call('_getdiskbyname', 0xf0000)
                 self.assertNotEqual(dt, 0)
+                self.assertEqual(word(dt+0x30), 1024)
                 self.assertEqual(opens, [b'/tmp/disktab'])
                 put(symbols['_dt'], dt)
                 call('_make_new_label')
                 label = symbols['_disk_label']
+                self.assertEqual(word(label+44+0x30), 1024)
                 self.assertEqual(bytes(uc.mem_read(label+44, 0x70)), bytes(uc.mem_read(dt, 0x70)))
                 # make_new_label supplies a default hostname at dt+0x70.
                 self.assertEqual(bytes(uc.mem_read(label+44+0x90, 532-0x90)),
