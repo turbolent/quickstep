@@ -134,6 +134,10 @@ The installer defaults to `sd1a`. If the USB stick has another device number,
 enter `-a` at the `boot:` prompt, then select its installer partition, such as
 `sd0a`.
 
+If the hardware supports both PS/2 and USB keyboards and you want to use a USB
+keyboard, enter `Query=Yes` at the `boot:` prompt, then skip `PS2Keyboard` when
+prompted to load drivers.
+
 ### Setup.app
 
 When included, open Setup.app from the mounted CD or OPENSTEP USB volume after booting and configuring the installed system, logged in as root.
