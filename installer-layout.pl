@@ -112,14 +112,14 @@ sub verify_layout {
     }
 }
 
-sub format_layout {
-    local($device, $formatter, @sizes) = @_;
+sub run_disk {
+    local($device, $formatter, $action, @sizes) = @_;
     # The CD/USB root, including /tmp, is read-only. Feed the native parser
     # through an anonymous pipe; no temporary files or /dev/fd are required.
     local($pid) = open(FORMAT, "|-");
     defined($pid) or die "Cannot start disk formatter: $!\n";
     if (!$pid) {
-        exec($formatter, "-t", "quickstep", "-N", "-i", "-u", $device);
+        exec($formatter, "-t", "quickstep", "-N", $action, "-u", $device);
         die "Cannot execute disk formatter: $!\n";
     }
     local($SIG{'PIPE'}) = 'IGNORE';
@@ -131,8 +131,8 @@ sub format_layout {
 sub main {
     local($mode, $device, $bootpath) = @ARGV;
     defined($device) && (($mode eq "plan" && @ARGV == 2) ||
-        (($mode eq "prepare" || $mode eq "verify" || $mode eq "format") && @ARGV == 3))
-        or die "Usage: installer-layout plan raw-disk | prepare|verify raw-disk boot1 | format raw-disk formatter\n";
+        (($mode eq "prepare" || $mode eq "verify" || $mode eq "format" || $mode eq "boot") && @ARGV == 3))
+        or die "Usage: installer-layout plan raw-disk | prepare|verify raw-disk boot1 | format|boot raw-disk formatter\n";
     local($sectors) = &disk_sectors($device);
     local(@sizes) = &layout($sectors);
     if ($mode eq "plan") {
@@ -146,8 +146,8 @@ sub main {
         printf "Space left unallocated: %.2f MiB\n", ($sectors - $used) / 2048;
         return;
     }
-    if ($mode eq "format") {
-        &format_layout($device, $bootpath, @sizes);
+    if ($mode eq "format" || $mode eq "boot") {
+        &run_disk($device, $bootpath, $mode eq "format" ? "-i" : "-b", @sizes);
         return;
     }
     open(BOOT, "<$bootpath") or die "Cannot read boot1: $!\n";

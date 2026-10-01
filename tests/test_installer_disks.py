@@ -119,7 +119,7 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, 'sd0a\n')
 
-    def test_native_boot_writes_keep_boot1_only_for_the_prepared_layout(self):
+    def test_only_prepared_layout_uses_private_disk_utility(self):
         self.helper = self.helper.replace('/usr/bin/perl', 'test_perl')
         prefix = '''native_disk() { printf "%s\\n" "$@"; return 7; }
             test_perl() { shift; printf "%s\\n" "$@"; return 7; }'''
@@ -133,10 +133,29 @@ class ShellTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 7, result.stderr)
                     expected = f'{action}\n/dev/disk name\n'
                     if fixed == 'yes' and action == '-b':
-                        expected = '-B0\n/usr/standalone/i386/boot1\n' + expected
+                        expected = f'verify\n/dev/disk name\n{shell_path(self.work)}/LayoutBoot1\n'
                     if fixed == 'yes' and action == '-i':
                         expected = f'format\n/dev/disk name\n{shell_path(self.work)}/layout-disk\n'
                     self.assertEqual(result.stdout, expected)
+
+    def test_boot_update_verifies_layout_and_stops_at_each_failure(self):
+        self.helper = self.helper.replace('/usr/bin/perl', 'test_perl')
+        for failure in (0, 1, 2, 3):
+            prefix = '''calls=0
+                native_disk() { echo UNEXPECTED; return 99; }
+                test_perl() {
+                    calls=$((calls + 1))
+                    printf '%s|%s|%s\\n' "$2" "$3" "$4"
+                    [ "$calls" != ''' + str(failure) + ''' ] || return 7
+                }'''
+            result = self.run_shell(prefix,
+                'CDDIR=/NextCD\nlivedisk=/dev/rsd0h\nQUICKSTEP_FIXED_LAYOUT=yes\n'
+                '${DISK} -b /dev/rsd0a || exit $?\necho CONTINUE')
+            expected = ['verify|/dev/rsd0h|/NextCD/LayoutBoot1',
+                        'boot|/dev/rsd0h|/NextCD/layout-disk',
+                        'verify|/dev/rsd0h|/NextCD/LayoutBoot1', 'CONTINUE']
+            self.assertEqual(result.returncode, 7 if failure else 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), expected[:failure] if failure else expected)
 
     def test_failed_empty_and_invalid_inquiries_never_reach_numeric_test(self):
         for body in ('return 1', 'echo ""', 'echo nope', 'echo -1', 'echo "4 096"'):

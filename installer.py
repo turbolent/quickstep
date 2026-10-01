@@ -13,14 +13,18 @@ DISK_PATH = '/NextCD/layout-disk'
 # _dgetent: replace open("/etc/disktab", 0) with fd 0; it still reads/closes it.
 # _boot: skip the boot1 write, which would overwrite the already prepared MBR
 # when -t bypasses partition inference. The secondary loaders remain enabled.
+# _main: skip DOS re-inference when updating an existing label. Its boot block
+# locations are absolute; _boot adds _uses_fdisk's physical base to logical sectors.
 _DISK_STREAM_PATCHES = {
     'aec5fa7501d2942cced00ad9c7fae46a36ffbcf1c840adbd0cf3fb9b83dee777': (
         (0x5ad4, bytes.fromhex('e8039b0000'), bytes.fromhex('31c0909090')),
         (0x3985, bytes.fromhex('0f84a1000000'), bytes.fromhex('e9a200000090')),
+        (0x283e, bytes.fromhex('e8e5f3ffff'), bytes.fromhex('31c0909090')),
     ),
     'ceec81bb3b8f3fc9c52a587ab191f5d09eae1cd879bad879d3ca7e301f53e5e9': (
         (0x58dc, bytes.fromhex('e8fb9c0000'), bytes.fromhex('31c0909090')),
         (0x378d, bytes.fromhex('0f84a1000000'), bytes.fromhex('e9a200000090')),
+        (0x2646, bytes.fromhex('e8e5f3ffff'), bytes.fromhex('31c0909090')),
     ),
 }
 
@@ -37,11 +41,12 @@ def layout_helper() -> bytes:
 
 
 def layout_disk(binary: bytes) -> bytes:
-    """Copy the known Intel disk utility for initialization from read-only media.
+    """Copy the known Intel disk utility for the installer's explicit layout.
 
     Read the explicit disktab from stdin and retain the MBR written by prepare.
     Only the installer copy is patched; /usr/etc/disk stays unchanged. This copy
-    is used exclusively with -t quickstep -N -i -u, without console input.
+    is used with -t quickstep -N -i -u or -t quickstep -N -b -u, without console
+    input. Boot-only updates use the existing label and preserve the MBR.
     """
     if binary[:4] == bytes.fromhex('cafebabe'):
         if len(binary) < 8:

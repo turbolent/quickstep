@@ -188,6 +188,11 @@ class LayoutHelperTests(unittest.TestCase):
         self.assertEqual(data[66*512:], b'x' * (62*512))
 
     def test_formatter_receives_pipe_and_reports_exec_or_child_failure(self):
+        for mode in ('format', 'boot'):
+            with self.subTest(mode=mode):
+                self.check_disk_pipe(mode)
+
+    def check_disk_pipe(self, mode):
         formatter = self.work / 'formatter'
         for status in (0, 7, None):
             with self.subTest(status=status):
@@ -201,12 +206,13 @@ class LayoutHelperTests(unittest.TestCase):
                 r = self.run_perl('''
                     *disk_sectors = sub { return 500118192; };
                     main(); print "DONE\\n";
-                ''', 'format', '/dev/rsd0h', shell_path(formatter))
+                ''', mode, '/dev/rsd0h', shell_path(formatter))
                 self.assertEqual(r.returncode == 0, status == 0, r.stderr)
                 self.assertEqual(b'DONE\n' in r.stdout, status == 0)
                 if status is not None:
                     expected = self.run_perl('print disktab(layout(500118192));')
-                    self.assertEqual(r.stdout, b'-t quickstep -N -i -u /dev/rsd0h\n'
+                    action = '-i' if mode == 'format' else '-b'
+                    self.assertEqual(r.stdout, f'-t quickstep -N {action} -u /dev/rsd0h\n'.encode()
                                      + expected.stdout + (b'DONE\n' if status == 0 else b''))
                 else:
                     self.assertIn(b'Cannot execute disk formatter', r.stderr)
@@ -240,7 +246,7 @@ class NativeDiskCopyTests(unittest.TestCase):
             symbols[name] = value
         return uc, symbols
 
-    def test_known_disk_copy_changes_only_two_instructions(self):
+    def test_known_disk_copy_changes_only_three_instructions(self):
         path = os.environ.get('INSTALLER_TEST_DISK')
         if not path:
             self.skipTest('INSTALLER_TEST_DISK required')
@@ -254,7 +260,7 @@ class NativeDiskCopyTests(unittest.TestCase):
         copied = installer.layout_disk(source)
         self.assertEqual(len(copied), len(thin))
         changed = [i for i, (old, new) in enumerate(zip(thin, copied)) if old != new]
-        self.assertEqual(len(changed), 9)
+        self.assertEqual(len(changed), 14)
         self.assertEqual(changed[-1] - changed[-5], 4)  # Five-byte open call.
         self.assertNotIn(b'/tmp/disktab', copied)
         self.assertNotIn(b'/tmp/qsboot1', copied)
@@ -346,6 +352,16 @@ class NativeDiskCopyTests(unittest.TestCase):
                 self.assertEqual(call('_getdiskbyname', 0xf0000), 0)
 
     def test_native_secondary_loaders_are_written_without_overwriting_mbr(self):
+        self.check_native_boot_write(from_main=False)
+
+    def test_native_boot_update_command_preserves_mbr_labels_and_filesystems(self):
+        self.check_native_boot_write(from_main=True)
+
+    def test_native_physical_dos_base_reproduces_label_overlap_error(self):
+        with self.assertRaisesRegex(AssertionError, 'boot block overlays labels'):
+            self.check_native_boot_write(from_main=False, dosbase=2)
+
+    def check_native_boot_write(self, *, from_main, dosbase=0):
         uc, symbols = self.load_disk()
         boot = b'loader!!' * 1024
         disk = bytearray(b'x' * (256 * 1024))
@@ -365,23 +381,46 @@ class NativeDiskCopyTests(unittest.TestCase):
             sp = machine.reg_read(x86.UC_X86_REG_ESP)
             if address == symbols['_malloc']:
                 value = 0x80000
-            elif address in (symbols['_free'], symbols['_printf'], symbols['_close']):
+            elif address in (symbols['_free'], symbols['_printf'], symbols['_close'],
+                             symbols['_init_arch_info'], symbols['_openlog'], symbols['_closelog']):
                 value = 0
+            elif address in (symbols['_init'], symbols['_Format'], symbols['_uses_fdisk'],
+                             symbols['_sd_inferdisktab'], symbols['_hd_inferdisktab']):
+                self.fail('boot update attempted formatting or DOS partition inference')
             elif address in (symbols['_bomb'], symbols['_dpanic']):
-                self.fail('native boot writer rejected the prepared layout')
+                message = bytes(machine.mem_read(word(sp+8), 128)).split(b'\0')[0]
+                self.assertEqual(writes, [])
+                self.fail('native boot writer rejected the prepared layout: ' + repr(message))
+            elif address == symbols['_exit']:
+                self.assertEqual(word(sp+4), 0)
+                machine.emu_stop()
+                return
+            elif address == symbols['_getdiskbyname']:
+                self.assertEqual(bytes(machine.mem_read(word(sp+4), 10)), b'quickstep\0')
+                value = symbols['_disk_label'] + 44
+            elif address == symbols['_ioctl']:
+                request = word(sp+8)
+                if request == 0x40306405:  # DKIOCINFO: physical sector size.
+                    put(word(sp+12)+0x28, 512)
+                else:
+                    self.assertEqual(request, 0x20006400)  # DKIOCGLABEL
+                    self.assertEqual(word(sp+12), symbols['_disk_label'])
+                value = 0
             elif address == symbols['_open']:
                 path = bytes(machine.mem_read(word(sp+4), 64)).split(b'\0')[0]
                 opens.append(path)
-                self.assertEqual(path, b'/secondary-loader')
-                value = 10
+                self.assertIn(path, (b'/secondary-loader', b'/dev/rsd0h', b'/dev/kmem'))
+                value = {b'/secondary-loader': 10, b'/dev/kmem': 11, b'/dev/rsd0h': 12}[path]
             elif address == symbols['_read']:
-                self.assertEqual(word(sp+4), 10)
-                data = boot[cursor:cursor+word(sp+12)]
+                fd = word(sp+4)
+                self.assertIn(fd, (10, 11))
+                data = boot[cursor:cursor+word(sp+12)] if fd == 10 else bytes(word(sp+12))
                 machine.mem_write(word(sp+8), data)
-                cursor += len(data)
+                if fd == 10:
+                    cursor += len(data)
                 value = len(data)
             elif address == symbols['_lseek']:
-                self.assertEqual((word(sp+4), word(sp+8), word(sp+12)), (10, 0, 0))
+                self.assertIn((word(sp+4), word(sp+8), word(sp+12)), ((10, 0, 0), (11, 0x11000, 0)))
                 cursor = value = 0
             elif address == 0xf2100:  # Driver's read-label callback.
                 value = 0
@@ -400,14 +439,16 @@ class NativeDiskCopyTests(unittest.TestCase):
         uc.hook_add(unicorn.UC_HOOK_CODE, hook)
         uc.mem_write(0xf3000, b'/secondary-loader\0')
         put(symbols['_bootfile'], 0xf3000)
-        put(symbols['_do_boot'], 1)
-        put(symbols['_do_boot0'], 1)
-        put(symbols['_do_boot1'], 1)
-        put(symbols['_dosdisk'], 0)  # -t bypasses DOS partition inference.
-        put(symbols['_dosbase'], 0)
+        if not from_main:
+            put(symbols['_do_boot'], 1)
+            put(symbols['_do_boot0'], 1)
+            put(symbols['_do_boot1'], 1)
+        put(symbols['_dosdisk'], 0)
+        put(symbols['_dosbase'], dosbase)
         put(symbols['_interactive'], 0)
         put(symbols['_devblklen'], 512)
         put(symbols['_dsp'], 0xf2000)
+        put(0xf2004, 0xffffffff)  # Stub driver supports the boot command.
         put(0xf2028, 0xf2100)
         put(0xf2010, 0xf2200)
         label = symbols['_disk_label']
@@ -416,11 +457,20 @@ class NativeDiskCopyTests(unittest.TestCase):
         put(label+44+0x50, 33)
         put(label+44+0x54, 97)
         put(0x100f000, 0xf1000)
+        if from_main:
+            args = [b'layout-disk', b'-t', b'quickstep', b'-N', b'-b', b'-u', b'/dev/rsd0h']
+            for i, arg in enumerate(args):
+                uc.mem_write(0xf4000+128*i, arg+b'\0')
+                put(0xf5000+4*i, 0xf4000+128*i)
+            put(0x100f004, len(args))
+            put(0x100f008, 0xf5000)
         uc.reg_write(x86.UC_X86_REG_ESP, 0x100f000)
-        uc.emu_start(symbols['_boot'], 0xf1000, count=1000000)
-        self.assertEqual(uc.reg_read(x86.UC_X86_REG_EIP), 0xf1000)
-        self.assertEqual(uc.reg_read(x86.UC_X86_REG_EAX), 0)
-        self.assertEqual(opens, [b'/secondary-loader'])
+        uc.emu_start(symbols['_main' if from_main else '_boot'], 0xf1000, count=1000000)
+        self.assertEqual(uc.reg_read(x86.UC_X86_REG_EIP), symbols['_exit'] if from_main else 0xf1000)
+        if not from_main:
+            self.assertEqual(uc.reg_read(x86.UC_X86_REG_EAX), 0)
+        self.assertEqual(opens, ([b'/dev/rsd0h', b'/dev/kmem', b'/dev/rsd0h'] if from_main else [])
+                         + [b'/secondary-loader'])
         self.assertEqual(writes, [66, 194])
         expected = bytearray(original)
         for block in (66, 194):

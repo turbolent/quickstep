@@ -31,9 +31,11 @@ quickstep_disk() {
             /usr/bin/perl "${CDDIR}/installer-layout" format "${livedisk}" "${CDDIR}/layout-disk" || return $?
             /usr/bin/perl "${CDDIR}/installer-layout" verify "${livedisk}" "${CDDIR}/LayoutBoot1" ;;
         yes:-b)
-            # Native disk otherwise reinstalls boot0 on partitioned disks.
-            # -B0 replaces the boot code while retaining the partition table.
-            ${QUICKSTEP_DISK} -B0 /usr/standalone/i386/boot1 "$@" ;;
+            # Stock disk mixes the physical DOS base with logical label sectors.
+            # Use the prepared layout and update only the secondary loaders.
+            /usr/bin/perl "${CDDIR}/installer-layout" verify "${livedisk}" "${CDDIR}/LayoutBoot1" || return $?
+            /usr/bin/perl "${CDDIR}/installer-layout" boot "${livedisk}" "${CDDIR}/layout-disk" || return $?
+            /usr/bin/perl "${CDDIR}/installer-layout" verify "${livedisk}" "${CDDIR}/LayoutBoot1" ;;
         *) ${QUICKSTEP_DISK} "$@" ;;
     esac
 }
