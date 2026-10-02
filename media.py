@@ -2257,6 +2257,7 @@ def prepare_installer_disks(ufs: PathInput, output: PathInput, *, usb: bool = Fa
         mbr = installer.limited_layout(image.read("/usr/standalone/i386/boot1"))
         assets = ((installer.MBR_PATH, mbr, 0o644),
                   (installer.HELPER_PATH, installer.layout_helper(), 0o644),
+                  (installer.MOUNTS_PATH, installer.mounts_helper(), 0o644),
                   (installer.DISK_PATH, installer.layout_disk(image.read('/usr/etc/disk')), 0o755))
         for target, data, mode in assets:
             image.write(target, data, replace(entry, mode=stat.S_IFREG | mode, size=len(data)), False)
@@ -2998,6 +2999,7 @@ def _verify_installer(boot: PathInput, user_cd: PathInput, iso: PathInput, *,
         original_disk = nextufs("browse", "--raw", kernel_source or user_cd, "/usr/etc/disk", binary=nextufs_binary)
         for path, expected in ((installer.DISK_PATH, installer.layout_disk(original_disk)),
                                (installer.HELPER_PATH, installer.layout_helper()),
+                               (installer.MOUNTS_PATH, installer.mounts_helper()),
                                ('/usr/etc/disk', original_disk)):
             if nextufs("browse", "--raw", iso, path, binary=nextufs_binary) != expected:
                 raise ValueError("installer partition asset differs: " + path)

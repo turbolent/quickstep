@@ -8,6 +8,7 @@ import struct
 MBR_PATH = '/NextCD/LayoutBoot1'
 HELPER_PATH = '/NextCD/installer-layout'
 DISK_PATH = '/NextCD/layout-disk'
+MOUNTS_PATH = '/NextCD/installer-mounts'
 
 # File offsets for the two supported Intel executables (stock and Patch 4).
 # _dgetent: replace open("/etc/disktab", 0) with fd 0; it still reads/closes it.
@@ -38,6 +39,10 @@ def limited_layout(boot1: bytes) -> bytes:
 
 def layout_helper() -> bytes:
     return Path(__file__).with_name('installer-layout.pl').read_text(encoding='ascii').encode('ascii')
+
+
+def mounts_helper() -> bytes:
+    return Path(__file__).with_name('installer-mounts.sh').read_text(encoding='ascii').encode('ascii')
 
 
 def layout_disk(binary: bytes) -> bytes:
@@ -170,4 +175,7 @@ fi
     edit(b'echo "/dev/${diskie} / 4.3 rw,noquota,noauto 0 1" > ${HD}/private/etc/fstab\n',
          b'echo "/dev/${diskie} / 4.3 rw,noquota,noauto 0 1" > ${HD}/private/etc/fstab\n'
          b'quickstep_data_volumes || exit 1\n')
+    # Run after required packages, which may replace the installed rc.boot.
+    edit(b'\n${SYNC}\n\necho\n${CHECKFLOP}',
+         b'\nquickstep_preserve_mounts || exit 1\n\n${SYNC}\n\necho\n${CHECKFLOP}')
     return script

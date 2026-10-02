@@ -90,4 +90,29 @@ quickstep_data_volumes() {
         data_index=`${EXPR} "$data_index" + 1` || return 1
     done
 }
+
+quickstep_preserve_mounts() {
+    case "$QUICKSTEP_VOLUMES" in 0|1) return 0 ;; [2-7]) ;; *) return 1 ;; esac
+    # BuildDisk rewrites fstab during the graphical installation stage. Keep
+    # only our extra volumes. Restore after root's fsck and writable remount;
+    # the restoration hook checks the extra volumes before multi-user mounts.
+    ${AWK} '$2 == "/usr/local" || $2 ~ /^\/Data[2-6]$/ { print }' \
+        "${HD}/private/etc/fstab" > "${HD}/private/etc/fstab.quickstep-volumes" || return 1
+    ${AWK} 'END { if (NR != volumes - 1) exit 1 }' volumes="$QUICKSTEP_VOLUMES" \
+        "${HD}/private/etc/fstab.quickstep-volumes" || return 1
+    ${CP} -p "${HD}/private/etc/rc.boot" "${HD}/private/etc/rc.boot.quickstep" || return 1
+    # OPENSTEP awk cannot parse redirected getline. Read the helper as the
+    # first input, then switch modes using its supported file assignments.
+    ${AWK} '
+        reading == 1 { saved[++lines] = $0; next }
+        /^exit 0$/ {
+            count++
+            for (i = 1; i <= lines; i++) print saved[i]
+        }
+        { print }
+        END { if (count != 1 || lines == 0) exit 1 }
+    ' reading=1 "${CDDIR}/installer-mounts" reading=0 "${HD}/private/etc/rc.boot" \
+        > "${HD}/private/etc/rc.boot.quickstep" || return 1
+    ${MV} "${HD}/private/etc/rc.boot.quickstep" "${HD}/private/etc/rc.boot"
+}
 # END quickstep disk limits

@@ -56,9 +56,10 @@ class VerificationTests(unittest.TestCase):
             files = {'/usr/etc/fdisk': b'native fdisk', '/usr/standalone/i386/boot1': boot1,
                      installer.MBR_PATH: installer.limited_layout(boot1), '/etc/rc.cdrom': expected,
                      '/usr/etc/disk': b'native disk', installer.DISK_PATH: b'layout disk',
+                     installer.MOUNTS_PATH: installer.mounts_helper(),
                      installer.HELPER_PATH: installer.layout_helper()}
             for fault in (None, '/usr/etc/fdisk', '/usr/etc/disk', installer.MBR_PATH,
-                          installer.DISK_PATH, installer.HELPER_PATH, '/etc/rc.cdrom'):
+                          installer.DISK_PATH, installer.HELPER_PATH, installer.MOUNTS_PATH, '/etc/rc.cdrom'):
                 with self.subTest(usb=usb, fault=fault):
                     def read(command, raw, source, path, **kwargs):
                         if source == 'original':
@@ -220,6 +221,100 @@ class ShellTests(unittest.TestCase):
                     self.assertEqual(result.returncode, status if count > 1 else 0, result.stderr)
                     self.assertEqual(result.stdout, f'-n\n/dev/{device[:-1]}b\n{shell_path(target)}/usr/local\n' if count > 1 else '')
 
+    def test_mounts_survive_graphical_installer_and_stop_restoring_after_completion(self):
+        target = self.work / 'target'
+        etc = target / 'private/etc'
+        adm = target / 'private/adm'
+        etc.mkdir(parents=True)
+        adm.mkdir()
+        (self.work / 'installer-mounts').write_bytes(installer.mounts_helper())
+        root = '/dev/sd2a / 4.3 rw,noquota,noauto 0 1\n'
+        source = '/dev/sd0a /NEXTSTEP_INSTALL 4.3 ro,noquota 0 2\n'
+        table = etc / 'fstab'
+        boot = etc / 'rc.boot'
+        boot.write_text('#!/bin/sh\niscdrom=0\nfsckerror=0\necho ROOT_FSCK\n'
+                        'writable=yes\necho REMOUNT\nexit 0\n')
+        table.write_text(root + source)
+        result = self.run_shell('', f'QUICKSTEP_VOLUMES=7\nHD="{shell_path(target)}"\n'
+            f'CDDIR="{shell_path(self.work)}"\ndiskie=sd2a\n'
+            'MKDIRS="mkdir -p"\nEXPR=expr\nCP=cp\nMV=mv\n'
+            'quickstep_data_volumes && quickstep_preserve_mounts')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extras = (etc / 'fstab.quickstep-volumes').read_text()
+        self.assertEqual(len(extras.splitlines()), 6)
+        patched = boot.read_text()
+        self.assertGreater(patched.index('# BEGIN quickstep installed mounts'), patched.index('echo REMOUNT'))
+        self.helper = ''
+        commands = patched.replace('/private/', shell_path(target) + '/private/')
+        commands = commands.replace('/usr/etc/fsck', 'check_volume').replace('/bin/cp', 'checked_cp')
+        checks = '''checked_cp() { [ "${writable-no}" = yes ] || return 99; cp "$@"; }
+check_volume() { printf 'CHECK %s %s\\n' "$1" "$2"; }
+'''
+        expected_checks = ''.join(f'CHECK -p /dev/sd2{letter}\n' for letter in 'bcdefg')
+        for marker in ('CDIS.custom', 'BuildDisk.custom', None):
+            if marker:
+                (adm / marker).touch()
+            # Model BuildDisk truncating fstab; retain unrelated entries and
+            # replace conflicts without duplicating devices or mountpoints.
+            other = '/dev/hd1a /Archive 4.3 rw 0 2\n'
+            table.write_text(root + other + '/dev/sd2b /old-local 4.3 rw 0 2\n')
+            result = self.run_shell(checks, commands)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, 'ROOT_FSCK\nREMOUNT\n' + expected_checks)
+            self.assertEqual(table.read_text(), root + other + extras)
+            self.assertEqual((etc / 'fstab.quickstep-volumes').exists(), marker is not None)
+            if marker:
+                (adm / marker).unlink()
+        table.write_text(root + '# manual configuration after installation\n')
+        result = self.run_shell(checks, commands)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(table.read_text(), root + '# manual configuration after installation\n')
+
+    def test_preserve_mounts_rejects_missing_boot_anchor_or_helper(self):
+        target = self.work / 'target'
+        etc = target / 'private/etc'
+        etc.mkdir(parents=True)
+        (etc / 'fstab').write_text('/dev/hd0b /usr/local 4.3 rw,noquota 0 2\n')
+        for source, helper in (('no anchor\n', True), ('exit 0\n', False)):
+            (etc / 'rc.boot').write_text(source)
+            asset = self.work / 'installer-mounts'
+            if helper:
+                asset.write_bytes(installer.mounts_helper())
+            elif asset.exists():
+                asset.unlink()
+            result = self.run_shell('', f'QUICKSTEP_VOLUMES=2\nHD="{shell_path(target)}"\n'
+                f'CDDIR="{shell_path(self.work)}"\nCP=cp\nMV=mv\nquickstep_preserve_mounts')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((etc / 'rc.boot').read_text(), source)
+
+    def test_boot_recovery_skips_single_user_and_retains_state_on_fsck_failure(self):
+        target = self.work / 'target'
+        etc = target / 'private/etc'
+        etc.mkdir(parents=True)
+        table = etc / 'fstab'
+        pending = etc / 'fstab.quickstep-volumes'
+        root = '/dev/sd0a / 4.3 rw,noquota,noauto 0 1\n'
+        extra = '/dev/sd0b /usr/local 4.3 rw,noquota 0 2\n'
+        self.helper = ''
+        hook = installer.mounts_helper().decode().replace('/private/', shell_path(target) + '/private/')
+        hook = hook.replace('/usr/etc/fsck', 'check_volume')
+        for argument, cdrom, failure in (('singleuser', 0, 0), ('autoboot', 1, 0),
+                                         ('autoboot', 0, 8)):
+            with self.subTest(argument=argument, cdrom=cdrom, failure=failure):
+                table.write_text(root)
+                pending.write_text(extra)
+                result = self.run_shell(
+                    f'check_volume() {{ echo CHECK; return {failure}; }}',
+                    f'set -- {argument}\niscdrom={cdrom}\n' + hook + '\necho CONTINUE')
+                self.assertEqual(result.returncode, 1 if failure else 0, result.stderr)
+                self.assertTrue(pending.exists())
+                if failure:
+                    self.assertEqual(result.stdout, 'CHECK\n')
+                    self.assertEqual(table.read_text(), root + extra)
+                else:
+                    self.assertEqual(result.stdout, 'CONTINUE\n')
+                    self.assertEqual(table.read_text(), root)
+
     def test_cd_large_disk_bypasses_fdisk_and_waits_for_confirmation(self):
         self.check_full_script(usb=False)
 
@@ -237,6 +332,7 @@ class ShellTests(unittest.TestCase):
         mount_hook = fixed.index('quickstep_mount_local || exit 1')
         self.assertLess(fixed.index('${MOUNT} -n /dev/$diskie'), mount_hook)
         self.assertLess(mount_hook, fixed.index('${DITTO} -T'))
+        self.assertGreater(fixed.index('quickstep_preserve_mounts || exit 1'), fixed.rindex('${DITTO}'))
         self.assertEqual('-useAllSectors' in fixed, usb)
         self.assertEqual('USB installation source' in fixed, usb)
         self.helper = fixed[fixed.index('# BEGIN quickstep disk limits'):fixed.index('# END quickstep disk limits')]
